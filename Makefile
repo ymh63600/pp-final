@@ -2,30 +2,52 @@
 # 核心變數
 # ----------------------------------------------------
 CXX = g++
-# 必須使用 C++17 或更高版本來支援 std::filesystem 和 chrono
 CXXFLAGS = -std=c++17 -Wall -Wextra -O3
-TARGET_BIN = serial
-SRC_FILE = serial.cpp
 
 # ----------------------------------------------------
-# 核心指令
+# 目標檔案
 # ----------------------------------------------------
+TARGET_SERIAL = serial
+SRC_SERIAL = serial.cpp
 
-.PHONY: all clean run
+TARGET_PTHREAD = pthread
+SRC_PTHREAD = pthread.cpp
 
-# 預設目標：編譯執行檔
-all: $(TARGET_BIN)
+TARGET_OPENMP = openmp
+SRC_OPENMP = openmp.cpp
 
-# 編譯規則
-$(TARGET_BIN): $(SRC_FILE)
+# ----------------------------------------------------
+# 指令
+# ----------------------------------------------------
+.PHONY: all clean run_serial run_pthread run_openmp
+
+all: $(TARGET_SERIAL) $(TARGET_PTHREAD) $(TARGET_OPENMP)
+
+# ---------------- Serial ----------------
+$(TARGET_SERIAL): $(SRC_SERIAL)
 	$(CXX) $(CXXFLAGS) $< -o $@
 
-# 執行指令
-run: $(TARGET_BIN)
-	@echo "--- Running $(TARGET_BIN) ---"
-	./$(TARGET_BIN)
+run_serial: $(TARGET_SERIAL)
+	@echo "--- Running $(TARGET_SERIAL) ---"
+	./$(TARGET_SERIAL)
 
-# 清理指令
+# ---------------- Pthread ----------------
+$(TARGET_PTHREAD): $(SRC_PTHREAD)
+	$(CXX) $(CXXFLAGS) $< -o $@ -pthread
+
+run_pthread: $(TARGET_PTHREAD)
+	@echo "--- Running $(TARGET_PTHREAD) ---"
+	./$(TARGET_PTHREAD)
+
+# ---------------- OpenMP ----------------
+$(TARGET_OPENMP): $(SRC_OPENMP)
+	$(CXX) $(CXXFLAGS) $< -o $@ -fopenmp
+
+run_openmp: $(TARGET_OPENMP)
+	@echo "--- Running $(TARGET_OPENMP) ---"
+	./$(TARGET_OPENMP)
+
+# ---------------- Clean ----------------
 clean:
 	@echo "Cleaning up generated files..."
-	rm -f $(TARGET_BIN) *.o
+	rm -f $(TARGET_SERIAL) $(TARGET_PTHREAD) $(TARGET_OPENMP) *.o
