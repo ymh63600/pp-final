@@ -190,6 +190,20 @@ int main(int argc, char* argv[]) {
          << chrono::duration<double>(t9 - t0).count()
          << " seconds\n";
     cout << "------------------------------------------\n";
+    // ====================================================
+    // 5. Save TF-IDF to CSV
+    // ====================================================
+    ofstream fout("openmp.csv");
+    fout << "document_id,word,tfidf_value\n";
+
+    for (size_t i = 0; i < tfidf.size(); i++) {
+        for (auto& [w, val] : tfidf[i]) {
+            fout << i << "," << w << "," << val << "\n";
+        }
+    }
+
+    fout.close();
+    cout << "TF-IDF saved to openmp.csv\n";
 
     return 0;
 }

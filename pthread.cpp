@@ -308,5 +308,19 @@ int main(int argc, char* argv[]) {
          << " seconds\n";
     cout << "------------------------------------------\n";
 
+    // ====================================================
+    // 5. Save TF-IDF to CSV
+    // ====================================================
+    ofstream fout("pthread.csv");
+    fout << "document_id,word,tfidf_value\n";
+
+    for (size_t i = 0; i < tfidf.size(); i++) {
+        for (auto& [w, val] : tfidf[i]) {
+            fout << i << "," << w << "," << val << "\n";
+        }
+    }
+
+    fout.close();
+    cout << "TF-IDF saved to pthread.csv\n";
     return 0;
 }

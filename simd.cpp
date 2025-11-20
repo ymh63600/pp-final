@@ -210,5 +210,16 @@ int main() {
     cout << "Total Execution Time (including load): " << total_duration << " seconds\n";
     cout << "------------------------------------------\n";
 
+    ofstream fout("simd.csv");
+    fout << "document_id,word,tfidf_value\n";
+
+    for (size_t i = 0; i < all_tfidf_results.size(); i++) {
+        for (auto& [w, val] : all_tfidf_results[i]) {
+            fout << i << "," << w << "," << val << "\n";
+        }
+    }
+
+    fout.close();
+    cout << "TF-IDF saved to simd.csv\n";
     return 0;
 }

@@ -19,18 +19,19 @@ SRC_PTHREAD = pthread.cpp
 TARGET_OPENMP = openmp
 SRC_OPENMP = openmp.cpp
 
-# 新增 SIMD 變數
 TARGET_SIMD = simd
 SRC_SIMD = simd.cpp
 
+TARGET_COMPARE = compare
+SRC_COMPARE = compare.cpp
 
 # ----------------------------------------------------
 # 指令
 # ----------------------------------------------------
-.PHONY: all clean run_serial run_pthread run_openmp run_simd
+.PHONY: all clean run_serial run_pthread run_openmp run_simd run_compare
 
 # all: 編譯所有目標
-all: $(TARGET_SERIAL) $(TARGET_PTHREAD) $(TARGET_OPENMP) $(TARGET_SIMD)
+all: $(TARGET_SERIAL) $(TARGET_PTHREAD) $(TARGET_OPENMP) $(TARGET_SIMD) $(TARGET_COMPARE)
 
 # ---------------- Serial ----------------
 $(TARGET_SERIAL): $(SRC_SERIAL)
@@ -64,7 +65,20 @@ run_simd: $(TARGET_SIMD)
 	@echo "--- Running $(TARGET_SIMD) ---"
 	./$(TARGET_SIMD)
 
+# ---------------- Compare CSV ----------------
+$(TARGET_COMPARE): $(SRC_COMPARE)
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+# 動態傳入 CSV 參數
+run_compare:
+	@echo "--- Running $(TARGET_COMPARE) ---"
+	@if [ "$$CSV1" = "" ] || [ "$$CSV2" = "" ]; then \
+	    echo "Usage: make run_compare CSV1=file1.csv CSV2=file2.csv"; \
+	else \
+	    ./$(TARGET_COMPARE) $$CSV1 $$CSV2; \
+	fi
+
 # ---------------- Clean ----------------
 clean:
 	@echo "Cleaning up generated files..."
-	rm -f $(TARGET_SERIAL) $(TARGET_PTHREAD) $(TARGET_OPENMP) $(TARGET_SIMD) *.o
+	rm -f $(TARGET_SERIAL) $(TARGET_PTHREAD) $(TARGET_OPENMP) $(TARGET_SIMD) $(TARGET_COMPARE) *.o
