@@ -1,6 +1,6 @@
-# TF-IDF Parallelization (Serial / Pthread / OpenMP)
+# TF-IDF Parallelization (Serial / SIMD/ Pthread / OpenMP)
 
-本專案示範如何使用 **Serial、Pthread、OpenMP** 實作加速版的 TF-IDF，並比較不同並行方法的效能。
+本專案示範如何使用 **Serial、SIMD、Pthread、OpenMP** 實作加速版的 TF-IDF，並比較不同並行方法的效能。
 
 ---
 
@@ -15,6 +15,7 @@ make
 成功後會生成以下可執行檔：
 
 * `serial`   — 單執行緒版本
+* `simd`     — SIMD 向量化版本 (需要支援 AVX2 的 CPU)
 * `pthread`  — Pthread 平行化版本
 * `openmp`   — OpenMP 平行化版本
 
@@ -31,8 +32,17 @@ make
 ```
 
 ---
+### 2. SIMD 版本
 
-### 2. Pthread 版本（可指定 thread 數）
+不需提供參數。
+
+```bash
+./simd
+```
+
+---
+
+### 3. Pthread 版本（可指定 thread 數）
 
 語法：
 
@@ -54,7 +64,7 @@ make
 
 ---
 
-### 3. OpenMP 版本（可指定 thread 數）
+### 4. OpenMP 版本（可指定 thread 數）
 
 語法：
 
