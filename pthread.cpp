@@ -197,11 +197,17 @@ map<string, double> computeIDF_parallel(
 // ========================== MAIN =======================
 // ======================================================
 
-int main() {
+int main(int argc, char* argv[]) {
     using Clock = chrono::high_resolution_clock;
 
     int num_threads = 8;
-
+    if (argc > 1) {
+        num_threads = atoi(argv[1]);
+        if (num_threads <= 0) {
+            cout << "Invalid thread number. Using default 8.\n";
+            num_threads = 8;
+        }
+    }
     cout << "--- Parallel TF-IDF Timing Report ---\n";
 
     // -----------------------------------------

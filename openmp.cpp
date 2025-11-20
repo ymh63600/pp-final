@@ -96,11 +96,15 @@ map<string, double> computeIDF_parallel(const vector<vector<string>>& docs) {
 // ======================================================
 // ========================== MAIN =======================
 // ======================================================
-int main() {
+int main(int argc, char* argv[]) {
     using Clock = chrono::high_resolution_clock;
 
     int num_threads = 8;
+    if (argc > 1)               
+        num_threads = atoi(argv[1]); 
+
     omp_set_num_threads(num_threads);
+
 
     cout << "--- OpenMP Parallel TF-IDF Timing Report ---\n";
 
