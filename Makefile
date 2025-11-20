@@ -51,7 +51,7 @@ $(TARGET_SERIAL): $(SRC_SERIAL)
 
 run_serial: $(TARGET_SERIAL)
 	@echo "--- Running $(TARGET_SERIAL) ---"
-	./$(TARGET_SERIAL)
+	run -- ./$(TARGET_SERIAL)
 
 # ---------------- Pthread ----------------
 $(TARGET_PTHREAD): $(SRC_PTHREAD)
@@ -59,7 +59,7 @@ $(TARGET_PTHREAD): $(SRC_PTHREAD)
 
 run_pthread: $(TARGET_PTHREAD)
 	@echo "--- Running $(TARGET_PTHREAD) ---"
-	./$(TARGET_PTHREAD)
+	run -c 4 -- ./$(TARGET_PTHREAD)
 
 # ---------------- OpenMP ----------------
 $(TARGET_OPENMP): $(SRC_OPENMP)
@@ -67,7 +67,7 @@ $(TARGET_OPENMP): $(SRC_OPENMP)
 
 run_openmp: $(TARGET_OPENMP)
 	@echo "--- Running $(TARGET_OPENMP) ---"
-	./$(TARGET_OPENMP)
+	run -c 4 -- ./$(TARGET_OPENMP)
 
 # ---------------- SIMD ----------------
 $(TARGET_SIMD): $(SRC_SIMD)
@@ -75,7 +75,7 @@ $(TARGET_SIMD): $(SRC_SIMD)
 
 run_simd: $(TARGET_SIMD)
 	@echo "--- Running $(TARGET_SIMD) ---"
-	./$(TARGET_SIMD)
+	run -- ./$(TARGET_SIMD)
 
 # ---------------- CUDA ----------------
 $(TARGET_CUDA): $(SRC_CUDA)
@@ -83,7 +83,7 @@ $(TARGET_CUDA): $(SRC_CUDA)
 
 run_cuda: $(TARGET_CUDA)
 	@echo "--- Running $(TARGET_CUDA) ---"
-	./$(TARGET_CUDA)
+	run -- ./$(TARGET_CUDA)
 
 # ---------------- MPI ----------------
 $(TARGET_MPI): $(SRC_MPI)
@@ -92,13 +92,7 @@ $(TARGET_MPI): $(SRC_MPI)
 # 用 NP 指定 process 數，例如：make run_mpi NP=8
 run_mpi: $(TARGET_MPI)
 	@echo "--- Running $(TARGET_MPI) ---"
-	@if [ -z "$$NP" ]; then \
-	    NP=8; \
-	else \
-	    NP="$$NP"; \
-	fi; \
-	echo "mpirun -np $$NP ./$(TARGET_MPI)"; \
-	mpirun -np $$NP ./$(TARGET_MPI)
+	run --mpi=pmix -N 4 -n 4 -- ./$(TARGET_MPI)
 
 # ---------------- Compare CSV ----------------
 $(TARGET_COMPARE): $(SRC_COMPARE)
