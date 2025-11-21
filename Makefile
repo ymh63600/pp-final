@@ -107,6 +107,11 @@ run_mpi: $(TARGET_MPI)
 	@echo "--- Running $(TARGET_MPI) ---"
 	run --mpi=pmix -N 4 -n 4 -- ./$(TARGET_MPI)
 
+#----------------- sklearn ------------
+run_sklearn: 
+	@echo "--- Running sklearn ---"
+	run -- python3 sklearn.py
+
 # ---------------- Compare CSV ----------------
 $(TARGET_COMPARE): $(SRC_COMPARE)
 	$(CXX) $(CXXFLAGS) $< -o $@
