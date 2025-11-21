@@ -30,7 +30,7 @@ make
 不需提供參數。
 
 ```bash
-run ./serial
+run -- ./serial
 ```
 
 ---
@@ -40,7 +40,7 @@ run ./serial
 不需提供參數。
 
 ```bash
-run ./simd
+run -- ./simd
 ```
 
 ---
@@ -106,22 +106,30 @@ run --mpi=pmix -N 2 -n 4 -- ./mpi
 語法：
 
 ```bash
-run ./cuda
+run -- ./cuda
+```
+
+### 6. python scikit 版本
+
+語法：
+
+```bash
+run -- python3 scikit.py
 ```
 
 ---
 
-### 7. Compare CSV 版本
+### 8. Compare CSV 版本
 
 用來比對兩個 CSV 檔案（TF-IDF 結果）。
 
-#### 7.1 直接執行
+#### 8.1 直接執行
 
 ```bash
 run ./compare file1.csv file2.csv
 ```
 
-#### 7.2 使用 Makefile 動態傳參
+#### 8.2 使用 Makefile 動態傳參
 
 ```bash
 make run_compare CSV1=file1.csv CSV2=file2.csv
