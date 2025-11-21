@@ -109,12 +109,12 @@ run --mpi=pmix -N 2 -n 4 -- ./mpi
 run -- ./cuda
 ```
 
-### 6. python scikit 版本
+### 6. python scikit-learn 版本
 
 語法：
 
 ```bash
-run -- python3 scikit.py
+run -- python3 sklearn.py
 ```
 
 ---
