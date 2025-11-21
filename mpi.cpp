@@ -126,10 +126,9 @@ void computeIDF_MPI(const vector<vector<string>>& tokenized,
     int local_len = static_cast<int>(local_str.size());
 
     if (world_rank == 0) {
-        // Rank 0: start with its own local_df
+        // Rank 0: merge global DF
         map<string, double> global_df = local_df;
 
-        // Receive from other ranks
         for (int src = 1; src < world_size; ++src) {
             int recv_len = 0;
             MPI_Recv(&recv_len, 1, MPI_INT, src, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -148,28 +147,50 @@ void computeIDF_MPI(const vector<vector<string>>& tokenized,
             }
         }
 
-        // Compute global IDF
-        out_idf.clear();
+        // Step 3: build ordered vocab and binary idf array
+        vector<string> vocab;
+        vector<double> idf_vals;
+        vocab.reserve(global_df.size());
+        idf_vals.reserve(global_df.size());
+
         for (const auto& kv : global_df) {
             const string& w = kv.first;
             double df = kv.second;
             if (df > 0.0) {
-                out_idf[w] = log(static_cast<double>(N) / df);
+                vocab.push_back(w);
+                idf_vals.push_back(log(static_cast<double>(N) / df));
             }
         }
 
-        // Serialize IDF and broadcast to all ranks
-        ostringstream oss_idf;
-        for (const auto& kv : out_idf) {
-            oss_idf << kv.first << " " << kv.second << "\n";
-        }
-        string idf_str = oss_idf.str();
-        int idf_len = static_cast<int>(idf_str.size());
+        int V = static_cast<int>(vocab.size());
 
-        MPI_Bcast(&idf_len, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        if (idf_len > 0) {
-            MPI_Bcast(idf_str.data(), idf_len, MPI_CHAR, 0, MPI_COMM_WORLD);
+        // Broadcast vocab size
+        MPI_Bcast(&V, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+        // Broadcast vocab strings as one packed char buffer
+        ostringstream oss_vocab;
+        for (const auto& w : vocab) {
+            oss_vocab << w << "\n";
         }
+        string vocab_str = oss_vocab.str();
+        int vocab_len = static_cast<int>(vocab_str.size());
+
+        MPI_Bcast(&vocab_len, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        if (vocab_len > 0) {
+            MPI_Bcast(vocab_str.data(), vocab_len, MPI_CHAR, 0, MPI_COMM_WORLD);
+        }
+
+        // Broadcast idf values in binary
+        if (V > 0) {
+            MPI_Bcast(idf_vals.data(), V, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        }
+
+        // Fill out_idf on rank 0
+        out_idf.clear();
+        for (int i = 0; i < V; ++i) {
+            out_idf[vocab[i]] = idf_vals[i];
+        }
+
     } else {
         // Non-root: send local_df to rank 0
         MPI_Send(&local_len, 1, MPI_INT, 0, 0, MPI_COMM_WORLD);
@@ -177,22 +198,46 @@ void computeIDF_MPI(const vector<vector<string>>& tokenized,
             MPI_Send(local_str.data(), local_len, MPI_CHAR, 0, 1, MPI_COMM_WORLD);
         }
 
-        // Receive global IDF from rank 0
-        int idf_len = 0;
-        MPI_Bcast(&idf_len, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        // Receive vocab size
+        int V = 0;
+        MPI_Bcast(&V, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-        out_idf.clear();
-        if (idf_len > 0) {
-            string idf_str;
-            idf_str.resize(idf_len);
-            MPI_Bcast(idf_str.data(), idf_len, MPI_CHAR, 0, MPI_COMM_WORLD);
+        // Receive vocab packed string
+        int vocab_len = 0;
+        MPI_Bcast(&vocab_len, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-            istringstream iss(idf_str);
+        vector<string> vocab;
+        vocab.reserve(V);
+
+        if (vocab_len > 0) {
+            string vocab_str;
+            vocab_str.resize(vocab_len);
+            MPI_Bcast(vocab_str.data(), vocab_len, MPI_CHAR, 0, MPI_COMM_WORLD);
+
+            istringstream iss_vocab(vocab_str);
             string w;
-            double val;
-            while (iss >> w >> val) {
-                out_idf[w] = val;
+            while (getline(iss_vocab, w)) {
+                if (!w.empty()) {
+                    vocab.push_back(w);
+                }
             }
+        }
+
+        // Receive idf values in binary
+        vector<double> idf_vals;
+        idf_vals.resize(V);
+
+        if (V > 0) {
+            MPI_Bcast(idf_vals.data(), V, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        }
+
+        // Rebuild out_idf
+        out_idf.clear();
+        int realV = static_cast<int>(vocab.size());
+        int useV = (realV < V) ? realV : V;
+
+        for (int i = 0; i < useV; ++i) {
+            out_idf[vocab[i]] = idf_vals[i];
         }
     }
 }
@@ -335,7 +380,7 @@ int main(int argc, char** argv) {
         double t_tf      = chrono::duration<double>(t4 - t3).count();
         double t_tfidf   = chrono::duration<double>(t5 - t4).count();
         double t_output  = chrono::duration<double>(t6 - t5).count();
-        double t_total   = chrono::duration<double>(t6 - t0).count();
+        double t_total   = chrono::duration<double>(t5 - t0).count();
 
         cout << "Timing (rank 0 approximate):" << endl;
         cout << "  Load documents:  " << t_load   << " s" << endl;
