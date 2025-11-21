@@ -99,7 +99,7 @@ map<string, double> computeIDF_parallel(const vector<vector<string>>& docs) {
 int main(int argc, char* argv[]) {
     using Clock = chrono::high_resolution_clock;
 
-    int num_threads = 8;
+    int num_threads = 4;
     if (argc > 1)               
         num_threads = atoi(argv[1]); 
 

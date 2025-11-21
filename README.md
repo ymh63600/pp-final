@@ -30,7 +30,7 @@ make
 不需提供參數。
 
 ```bash
-./serial
+run ./serial
 ```
 
 ---
@@ -40,7 +40,7 @@ make
 不需提供參數。
 
 ```bash
-./simd
+run ./simd
 ```
 
 ---
@@ -50,19 +50,19 @@ make
 語法：
 
 ```bash
-./pthread <thread-num>
+run -c <thread-num> -- ./pthread <thread-num>
 ```
 
 例如指定 6 threads：
 
 ```bash
-./pthread 6
+run -c 6 -- ./pthread 6
 ```
 
-若不帶參數，預設使用 **8 threads**：
+若不帶參數，預設使用 **4 threads**：
 
 ```bash
-./pthread
+run -c 4 -- ./pthread
 ```
 
 ---
@@ -72,19 +72,19 @@ make
 語法：
 
 ```bash
-./openmp <thread-num>
+run -c <thread-num> -- ./openmp <thread-num>
 ```
 
 例如：
 
 ```bash
-./openmp 8
+run -c 8 -- ./openmp 8
 ```
 
-若不帶參數，預設使用 **8 threads**：
+若不帶參數，預設使用 **4 threads**：
 
 ```bash
-./openmp
+run -c 4 -- ./openmp
 ```
 
 ### 5. MPI 版本
@@ -118,7 +118,7 @@ run ./cuda
 #### 7.1 直接執行
 
 ```bash
-./compare file1.csv file2.csv
+run ./compare file1.csv file2.csv
 ```
 
 #### 7.2 使用 Makefile 動態傳參

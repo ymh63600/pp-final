@@ -45,6 +45,15 @@ SRC_MPI        = mpi.cpp
 # all: 編譯所有目標
 all: $(TARGET_SERIAL) $(TARGET_PTHREAD) $(TARGET_OPENMP) $(TARGET_SIMD) $(TARGET_COMPARE) $(TARGET_CUDA) $(TARGET_MPI)
 
+# Default thread count if not specified
+DEFAULT_THREADS = 4
+
+# Extract numeric parameter (e.g., make run_openmp 8 → NUM=8)
+NUM := $(filter-out run_pthread run_openmp,$(MAKECMDGOALS))
+ifeq ($(NUM),)
+    NUM := $(DEFAULT_THREADS)
+endif
+
 # ---------------- Serial ----------------
 $(TARGET_SERIAL): $(SRC_SERIAL)
 	$(CXX) $(CXXFLAGS) $< -o $@
@@ -53,22 +62,6 @@ run_serial: $(TARGET_SERIAL)
 	@echo "--- Running $(TARGET_SERIAL) ---"
 	run -- ./$(TARGET_SERIAL)
 
-# ---------------- Pthread ----------------
-$(TARGET_PTHREAD): $(SRC_PTHREAD)
-	$(CXX) $(CXXFLAGS) $< -o $@ -pthread
-
-run_pthread: $(TARGET_PTHREAD)
-	@echo "--- Running $(TARGET_PTHREAD) ---"
-	run -c 4 -- ./$(TARGET_PTHREAD)
-
-# ---------------- OpenMP ----------------
-$(TARGET_OPENMP): $(SRC_OPENMP)
-	$(CXX) $(CXXFLAGS) $< -o $@ -fopenmp
-
-run_openmp: $(TARGET_OPENMP)
-	@echo "--- Running $(TARGET_OPENMP) ---"
-	run -c 4 -- ./$(TARGET_OPENMP)
-
 # ---------------- SIMD ----------------
 $(TARGET_SIMD): $(SRC_SIMD)
 	$(CXX) $(CXXFLAGS) $(SIMD_FLAGS) $< -o $@
@@ -76,6 +69,26 @@ $(TARGET_SIMD): $(SRC_SIMD)
 run_simd: $(TARGET_SIMD)
 	@echo "--- Running $(TARGET_SIMD) ---"
 	run -- ./$(TARGET_SIMD)
+
+# ---------------- Pthread ----------------
+$(TARGET_PTHREAD): $(SRC_PTHREAD)
+	$(CXX) $(CXXFLAGS) $< -o $@ -pthread
+
+run_pthread: $(TARGET_PTHREAD)
+	@echo "--- Running $(TARGET_PTHREAD) with $(NUM) threads ---"
+	run -c $(NUM) -- ./$(TARGET_PTHREAD) $(NUM)
+
+# ---------------- OpenMP ----------------
+$(TARGET_OPENMP): $(SRC_OPENMP)
+	$(CXX) $(CXXFLAGS) $< -o $@ -fopenmp
+
+run_openmp: $(TARGET_OPENMP)
+	@echo "--- Running $(TARGET_OPENMP) with $(NUM) threads ---"
+	run -c $(NUM) -- ./$(TARGET_OPENMP) $(NUM)
+
+# Prevent make from treating numbers as targets
+%:
+	@:
 
 # ---------------- CUDA ----------------
 $(TARGET_CUDA): $(SRC_CUDA)
