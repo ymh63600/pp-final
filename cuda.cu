@@ -1,36 +1,50 @@
 // cuda.cu
 #include <cuda_runtime.h>
+#include <thrust/device_vector.h>
+#include <thrust/sort.h>
+#include <thrust/reduce.h>
+#include <thrust/transform.h>
+#include <thrust/iterator/zip_iterator.h>
 #include <iostream>
 #include <vector>
 #include <string>
-#include <sstream>
-#include <unordered_map>
 #include <fstream>
 #include <filesystem>
 #include <chrono>
-#include <numeric>   // std::iota
-#include <algorithm> // std::sort
+#include <numeric>
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cctype>
+#include <unordered_map>
 
 using namespace std;
 namespace fs = std::filesystem;
 
-// ---------------------------
-// Tokenize text into words
-// ---------------------------
-vector<string> tokenize(const string& text) {
-    vector<string> tokens;
-    stringstream ss(text);
-    string w;
-    while (ss >> w) {
-        tokens.push_back(w);
+using Clock = chrono::high_resolution_clock;
+
+// ------------------------------------------------------------
+// Fast whitespace tokenizer (same semantics as stringstream >> w)
+// ------------------------------------------------------------
+static inline void tokenize_ws(const string& text, vector<string>& out_tokens) {
+    out_tokens.clear();
+    const char* s = text.c_str();
+    size_t n = text.size();
+    size_t i = 0;
+
+    while (i < n) {
+        while (i < n && isspace((unsigned char)s[i])) ++i;
+        if (i >= n) break;
+        size_t j = i;
+        while (j < n && !isspace((unsigned char)s[j])) ++j;
+        out_tokens.emplace_back(text.substr(i, j - i));
+        i = j;
     }
-    return tokens;
 }
 
-// ---------------------------
+// ------------------------------------------------------------
 // Load 20-Newsgroups files
-// ---------------------------
+// ------------------------------------------------------------
 void load_20newsgroups(const string& root, vector<string>& documents) {
     for (const auto& entry : fs::recursive_directory_iterator(root)) {
         if (entry.is_regular_file() && entry.path().extension() == ".txt") {
@@ -40,124 +54,116 @@ void load_20newsgroups(const string& root, vector<string>& documents) {
             string line;
             string content;
             while (getline(fin, line)) {
-                content += line + " ";
+                content += line;
+                content.push_back(' ');
             }
-            documents.push_back(content);
+            documents.push_back(std::move(content));
         }
     }
 }
 
-// ---------------------------
-// CUDA kernel 1: TF counting on GPU (dense N x V)
-// 每個 block 處理一篇 document，threads 在該 doc 的 tokens 上並行，對 counts[d, term] 作 atomicAdd
-// counts 使用 int，避免 atomicAdd(double*) 的相容性問題
-// ---------------------------
+// ------------------------------------------------------------
+// CUDA kernels for sparse pipeline
+// ------------------------------------------------------------
 __global__
-void tf_count_kernel(const int* terms_flat,
-                     const int* doc_offsets,
-                     const int* doc_len,
-                     int* counts,
-                     int num_docs,
-                     int vocab_size)
+void scatter_df_kernel(const int* terms_df,
+                       const int* df_vals,
+                       int* df_dense,
+                       int n_df)
 {
-    int d = blockIdx.x; // one block per doc
-    if (d >= num_docs) return;
-
-    int start = doc_offsets[d];
-    int len   = doc_len[d];
-
-    for (int i = threadIdx.x; i < len; i += blockDim.x) {
-        int term = terms_flat[start + i];
-        if (term >= 0 && term < vocab_size) {
-            atomicAdd(&counts[(size_t)d * vocab_size + term], 1);
-        }
-    }
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_df) return;
+    int t = terms_df[i];
+    df_dense[t] = df_vals[i];
 }
 
-// ---------------------------
-// CUDA kernel 2 (Level 3): 從 counts 計算每個 term 的 df[t]
-// df[t] = 有幾篇 doc 的 counts[d, t] > 0
-// ---------------------------
 __global__
-void df_from_counts_kernel(const int* counts,
-                           int* df,
-                           int num_docs,
-                           int vocab_size)
-{
-    int t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= vocab_size) return;
-
-    int df_count = 0;
-    for (int d = 0; d < num_docs; ++d) {
-        int c = counts[d * vocab_size + t];
-        if (c > 0) {
-            ++df_count;
-        }
-    }
-    df[t] = df_count;
-}
-
-// ---------------------------
-// CUDA kernel 3: TF-IDF = (count / doc_len) * IDF
-// counts: [N * V] (int), idf: [V] (double), doc_len: [N], tfidf: [N * V] (double)
-// ---------------------------
-__global__
-void tfidf_dense_kernel(const int* counts,
-                        const double* idf,
-                        const int* doc_len,
-                        double* tfidf,
+void compute_idf_kernel(const int* df_dense,
+                        double* idf_dense,
                         int num_docs,
                         int vocab_size)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    long long total_ll = (long long)num_docs * (long long)vocab_size;
-    if ((long long)idx >= total_ll) return;
-
-    int doc  = idx / vocab_size;
-    int term = idx % vocab_size;
-    int len  = doc_len[doc];
-
-    if (len <= 0) {
-        tfidf[idx] = 0.0;
-        return;
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= vocab_size) return;
+    int df_t = df_dense[t];
+    if (df_t > 0) {
+        idf_dense[t] = log((double)num_docs / (double)df_t);
+    } else {
+        idf_dense[t] = 0.0;
     }
-
-    int c = counts[idx];
-    if (c == 0) {
-        tfidf[idx] = 0.0;
-        return;
-    }
-
-    double tf = static_cast<double>(c) / static_cast<double>(len);
-    tfidf[idx] = tf * idf[term];
 }
 
-// ---------------------------
+__global__
+void tfidf_sparse_kernel(const int* doc_ids,
+                         const int* term_ids,
+                         const int* counts_nnz,
+                         const int* doc_len,
+                         const double* idf_dense,
+                         double* tfidf_vals,
+                         int nnz)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nnz) return;
+
+    int d = doc_ids[i];
+    int t = term_ids[i];
+    int c = counts_nnz[i];
+    int len = doc_len[d];
+
+    if (len <= 0 || c <= 0) {
+        tfidf_vals[i] = 0.0;
+        return;
+    }
+
+    double tf = (double)c / (double)len;
+    tfidf_vals[i] = tf * idf_dense[t];
+}
+
+// ------------------------------------------------------------
+// Thrust functors
+// ------------------------------------------------------------
+struct MakeKeyFunctor {
+    int V;
+    __host__ __device__
+    uint64_t operator()(const thrust::tuple<int,int>& x) const {
+        uint64_t d = (uint64_t)thrust::get<0>(x);
+        uint64_t t = (uint64_t)thrust::get<1>(x);
+        return d * (uint64_t)V + t;
+    }
+};
+
+struct KeyToDocFunctor {
+    int V;
+    __host__ __device__
+    int operator()(const uint64_t& k) const {
+        return (int)(k / (uint64_t)V);
+    }
+};
+
+struct KeyToTermFunctor {
+    int V;
+    __host__ __device__
+    int operator()(const uint64_t& k) const {
+        return (int)(k % (uint64_t)V);
+    }
+};
+
+// ------------------------------------------------------------
 // Main
-// ---------------------------
+// ------------------------------------------------------------
 int main() {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
 
-    using Clock = chrono::high_resolution_clock;
-
-    // 這四個 vector 提前宣告，避免 goto 跳過初始化
-    vector<int>    df_host;
-    vector<double> idf_vec;
-    vector<int>    counts_host;
-    vector<double> tfidf_host;
-
-    // ---------------------------
     // Phase 1: Load documents
-    // ---------------------------
     auto t0 = Clock::now();
     vector<string> documents;
     string dataset_path = "dataset";
     load_20newsgroups(dataset_path, documents);
     auto t1 = Clock::now();
 
-    int N = static_cast<int>(documents.size());
-    cout << "--- CUDA TF-IDF Timing Report (TF+IDF+TF-IDF with DF on GPU) ---" << endl;
+    int N = (int)documents.size();
+    cout << "--- CUDA TF-IDF Timing Report (Sparse TF DF IDF TF-IDF) ---" << endl;
     cout << "Total Documents Loaded: " << N << endl;
     cout << "Document Loading Time: "
          << chrono::duration<double>(t1 - t0).count() << " seconds" << endl;
@@ -167,56 +173,58 @@ int main() {
         return 1;
     }
 
-    // ---------------------------
-    // Phase 2: Tokenization (CPU)
-    // ---------------------------
+    // Phase 2: Tokenization on CPU (fast scan)
     auto t2 = Clock::now();
     vector<vector<string>> tokenized_docs;
     tokenized_docs.reserve(N);
+
+    vector<string> tmp_tokens;
     for (const auto& doc : documents) {
-        tokenized_docs.push_back(tokenize(doc));
+        tokenize_ws(doc, tmp_tokens);
+        tokenized_docs.push_back(tmp_tokens);
     }
     auto t3 = Clock::now();
-    cout << "Tokenization Time (CPU): "
+    cout << "Tokenization Time (CPU fast scan): "
          << chrono::duration<double>(t3 - t2).count() << " seconds" << endl;
 
-    // ---------------------------
-    // Phase 3: Build vocab (unordered) + term indices (old id)，同時建立 doc_offsets / doc_len
-    // ---------------------------
+    // Phase 3: Build vocab (unordered_map, no duplicate keys) and flatten tokens
     auto t4 = Clock::now();
 
     unordered_map<string, int> word2id;
-    word2id.reserve(400000); // 粗估，避免 rehash
+    word2id.reserve(400000);
+    word2id.max_load_factor(0.7f);
+
     vector<string> vocab_unsorted;
     vocab_unsorted.reserve(400000);
 
-    vector<int> doc_offsets(N + 1, 0);
     vector<int> doc_len(N, 0);
-    vector<int> terms_flat;  // 使用 old_id
-    terms_flat.reserve(10000000); // 粗估
+    vector<int> terms_flat;
+    terms_flat.reserve(10000000);
+    vector<int> doc_ids_flat;
+    doc_ids_flat.reserve(10000000);
 
     size_t total_tokens = 0;
     for (int d = 0; d < N; ++d) {
-        doc_offsets[d] = static_cast<int>(total_tokens);
         for (const auto& w : tokenized_docs[d]) {
-            int term_id;
             auto it = word2id.find(w);
+            int term_id;
             if (it == word2id.end()) {
-                term_id = static_cast<int>(vocab_unsorted.size());
+                term_id = (int)vocab_unsorted.size();
                 vocab_unsorted.push_back(w);
                 word2id.emplace(w, term_id);
             } else {
                 term_id = it->second;
             }
+
             terms_flat.push_back(term_id);
+            doc_ids_flat.push_back(d);
             ++total_tokens;
             ++doc_len[d];
         }
     }
-    doc_offsets[N] = static_cast<int>(total_tokens);
 
     auto t5 = Clock::now();
-    cout << "Build vocab (unordered) + term indices Time (CPU): "
+    cout << "Build vocab (unordered_map) + term indices Time (CPU): "
          << chrono::duration<double>(t5 - t4).count() << " seconds" << endl;
     cout << "Total mapped tokens: " << total_tokens << endl;
 
@@ -225,20 +233,15 @@ int main() {
         return 0;
     }
 
-    // ---------------------------
-    // Phase 4: 將 vocab 依字典序排序，並把 terms_flat 的 term id remap 成「字典序順序」
-    // 這樣輸出的 vocabulary 順序會與 serial.cpp 的 map<string,double> 一致
-    // ---------------------------
+    // Phase 4: Sort vocab lexicographically and remap ids
     auto t6 = Clock::now();
 
-    int oldV = static_cast<int>(vocab_unsorted.size());
+    int oldV = (int)vocab_unsorted.size();
     vector<int> perm(oldV);
-    std::iota(perm.begin(), perm.end(), 0);
+    iota(perm.begin(), perm.end(), 0);
 
-    std::sort(perm.begin(), perm.end(),
-              [&](int a, int b) {
-                  return vocab_unsorted[a] < vocab_unsorted[b];
-              });
+    sort(perm.begin(), perm.end(),
+         [&](int a, int b) { return vocab_unsorted[a] < vocab_unsorted[b]; });
 
     int V = oldV;
     vector<string> vocab(V);
@@ -250,10 +253,8 @@ int main() {
         old2new[old_id] = new_id;
     }
 
-    // remap terms_flat: old_id -> new_id (字典序)
     for (size_t i = 0; i < terms_flat.size(); ++i) {
-        int old_id = terms_flat[i];
-        terms_flat[i] = old2new[old_id];
+        terms_flat[i] = old2new[terms_flat[i]];
     }
 
     auto t7 = Clock::now();
@@ -261,287 +262,164 @@ int main() {
          << chrono::duration<double>(t7 - t6).count() << " seconds" << endl;
     cout << "Final Vocabulary Size: " << V << endl;
 
-    // host buffer 在知道 N / V 之後再 resize
-    df_host.assign(V, 0);
-    idf_vec.assign(V, 0.0);
-    counts_host.assign(static_cast<size_t>(N) * V, 0);
-    tfidf_host.assign(static_cast<size_t>(N) * V, 0.0);
-
-    // ---------------------------
-    // Phase 5: TF / DF (GPU) + IDF (CPU log) + TF-IDF (GPU)
-    // 1) tf_count_kernel: counts[d,t]
-    // 2) df_from_counts_kernel: df[t] = #docs with counts>0
-    // 3) host: idf[t] = log(N / df[t])
-    // 4) tfidf_dense_kernel: tfidf = (counts / doc_len) * idf
-    // ---------------------------
+    // Phase 5: Sparse GPU pipeline
     auto t8 = Clock::now();
 
-    int*    d_counts      = nullptr; // [N * V] int
-    double* d_tfidf       = nullptr; // [N * V] double
-    int*    d_terms       = nullptr; // [total_tokens] int
-    int*    d_doc_offsets = nullptr; // [N+1] int
-    int*    d_doc_len     = nullptr; // [N] int
-    int*    d_df          = nullptr; // [V] int
-    double* d_idf         = nullptr; // [V] double
+    thrust::device_vector<int> d_terms(terms_flat.begin(), terms_flat.end());
+    thrust::device_vector<int> d_doc_ids(doc_ids_flat.begin(), doc_ids_flat.end());
+    thrust::device_vector<int> d_doc_len(doc_len.begin(), doc_len.end());
 
-    size_t counts_bytes      = static_cast<size_t>(N) * V * sizeof(int);
-    size_t tfidf_bytes       = static_cast<size_t>(N) * V * sizeof(double);
-    size_t terms_bytes       = static_cast<size_t>(total_tokens) * sizeof(int);
-    size_t doc_offsets_bytes = static_cast<size_t>(N + 1) * sizeof(int);
-    size_t doc_len_bytes     = static_cast<size_t>(N) * sizeof(int);
-    size_t df_bytes          = static_cast<size_t>(V) * sizeof(int);
-    size_t idf_bytes         = static_cast<size_t>(V) * sizeof(double);
+    // Build keys = doc * V + term
+    thrust::device_vector<uint64_t> d_keys(total_tokens);
+    MakeKeyFunctor make_key{V};
+    thrust::transform(
+        thrust::make_zip_iterator(thrust::make_tuple(d_doc_ids.begin(), d_terms.begin())),
+        thrust::make_zip_iterator(thrust::make_tuple(d_doc_ids.end(), d_terms.end())),
+        d_keys.begin(),
+        make_key
+    );
 
-    cudaError_t err;
-    // --- allocate device memory ---
-    err = cudaMalloc(&d_counts, counts_bytes);
-    if (err != cudaSuccess) {
-        cerr << "cudaMalloc d_counts failed: " << cudaGetErrorString(err) << endl;
-        return 1;
-    }
-    err = cudaMalloc(&d_tfidf, tfidf_bytes);
-    if (err != cudaSuccess) {
-        cerr << "cudaMalloc d_tfidf failed: " << cudaGetErrorString(err) << endl;
-        cudaFree(d_counts);
-        return 1;
-    }
-    err = cudaMalloc(&d_terms, terms_bytes);
-    if (err != cudaSuccess) {
-        cerr << "cudaMalloc d_terms failed: " << cudaGetErrorString(err) << endl;
-        cudaFree(d_counts);
-        cudaFree(d_tfidf);
-        return 1;
-    }
-    err = cudaMalloc(&d_doc_offsets, doc_offsets_bytes);
-    if (err != cudaSuccess) {
-        cerr << "cudaMalloc d_doc_offsets failed: " << cudaGetErrorString(err) << endl;
-        cudaFree(d_counts);
-        cudaFree(d_tfidf);
-        cudaFree(d_terms);
-        return 1;
-    }
-    err = cudaMalloc(&d_doc_len, doc_len_bytes);
-    if (err != cudaSuccess) {
-        cerr << "cudaMalloc d_doc_len failed: " << cudaGetErrorString(err) << endl;
-        cudaFree(d_counts);
-        cudaFree(d_tfidf);
-        cudaFree(d_terms);
-        cudaFree(d_doc_offsets);
-        return 1;
-    }
-    err = cudaMalloc(&d_df, df_bytes);
-    if (err != cudaSuccess) {
-        cerr << "cudaMalloc d_df failed: " << cudaGetErrorString(err) << endl;
-        cudaFree(d_counts);
-        cudaFree(d_tfidf);
-        cudaFree(d_terms);
-        cudaFree(d_doc_offsets);
-        cudaFree(d_doc_len);
-        return 1;
-    }
-    err = cudaMalloc(&d_idf, idf_bytes);
-    if (err != cudaSuccess) {
-        cerr << "cudaMalloc d_idf failed: " << cudaGetErrorString(err) << endl;
-        cudaFree(d_counts);
-        cudaFree(d_tfidf);
-        cudaFree(d_terms);
-        cudaFree(d_doc_offsets);
-        cudaFree(d_doc_len);
-        cudaFree(d_df);
-        return 1;
-    }
+    // Sort keys and reduce to sparse counts
+    auto t_tf_start = Clock::now();
 
-    // 初始化 counts / df
-    err = cudaMemset(d_counts, 0, counts_bytes);
-    if (err != cudaSuccess) {
-        cerr << "cudaMemset d_counts failed: " << cudaGetErrorString(err) << endl;
-        goto GPU_CLEANUP;
-    }
-    err = cudaMemset(d_df, 0, df_bytes);
-    if (err != cudaSuccess) {
-        cerr << "cudaMemset d_df failed: " << cudaGetErrorString(err) << endl;
-        goto GPU_CLEANUP;
-    }
+    thrust::sort(d_keys.begin(), d_keys.end());
 
-    // Host -> Device
-    err = cudaMemcpy(d_terms, terms_flat.data(), terms_bytes, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) {
-        cerr << "cudaMemcpy terms_flat -> d_terms failed: " << cudaGetErrorString(err) << endl;
-        goto GPU_CLEANUP;
-    }
-    err = cudaMemcpy(d_doc_offsets, doc_offsets.data(), doc_offsets_bytes, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) {
-        cerr << "cudaMemcpy doc_offsets -> d_doc_offsets failed: " << cudaGetErrorString(err) << endl;
-        goto GPU_CLEANUP;
-    }
-    err = cudaMemcpy(d_doc_len, doc_len.data(), doc_len_bytes, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) {
-        cerr << "cudaMemcpy doc_len -> d_doc_len failed: " << cudaGetErrorString(err) << endl;
-        goto GPU_CLEANUP;
-    }
+    thrust::device_vector<uint64_t> d_ukeys(total_tokens);
+    thrust::device_vector<int> d_ones(total_tokens, 1);
+    thrust::device_vector<int> d_counts_nnz(total_tokens);
 
-    // ---- Kernel 1: TF counting ----
+    auto new_end = thrust::reduce_by_key(
+        d_keys.begin(), d_keys.end(),
+        d_ones.begin(),
+        d_ukeys.begin(),
+        d_counts_nnz.begin()
+    );
+
+    int nnz = (int)(new_end.first - d_ukeys.begin());
+    d_ukeys.resize(nnz);
+    d_counts_nnz.resize(nnz);
+
+    cudaDeviceSynchronize();
+    auto t_tf_end = Clock::now();
+
+    cout << "TF counting (sparse sort reduce on GPU) Time: "
+         << chrono::duration<double>(t_tf_end - t_tf_start).count()
+         << " seconds (nnz=" << nnz << ")" << endl;
+
+    // Extract doc_ids_nnz and term_ids_nnz
+    thrust::device_vector<int> d_doc_ids_nnz(nnz);
+    thrust::device_vector<int> d_term_ids_nnz(nnz);
+
+    KeyToDocFunctor key_to_doc{V};
+    KeyToTermFunctor key_to_term{V};
+    thrust::transform(d_ukeys.begin(), d_ukeys.end(), d_doc_ids_nnz.begin(), key_to_doc);
+    thrust::transform(d_ukeys.begin(), d_ukeys.end(), d_term_ids_nnz.begin(), key_to_term);
+
+    // DF by reducing term ids (each unique (doc,term) contributes 1)
+    auto t_df_start = Clock::now();
+
+    thrust::device_vector<int> d_term_for_df = d_term_ids_nnz;
+    thrust::sort(d_term_for_df.begin(), d_term_for_df.end());
+
+    thrust::device_vector<int> d_terms_df(nnz);
+    thrust::device_vector<int> d_df_vals(nnz);
+    thrust::device_vector<int> d_ones_df(nnz, 1);
+
+    auto df_end = thrust::reduce_by_key(
+        d_term_for_df.begin(), d_term_for_df.end(),
+        d_ones_df.begin(),
+        d_terms_df.begin(),
+        d_df_vals.begin()
+    );
+
+    int n_df = (int)(df_end.first - d_terms_df.begin());
+    d_terms_df.resize(n_df);
+    d_df_vals.resize(n_df);
+
+    cudaDeviceSynchronize();
+    auto t_df_end = Clock::now();
+
+    cout << "DF reduce on GPU Time: "
+         << chrono::duration<double>(t_df_end - t_df_start).count()
+         << " seconds (unique_terms=" << n_df << ")" << endl;
+
+    // Scatter DF to dense and compute dense IDF
+    thrust::device_vector<int> d_df_dense(V, 0);
+    thrust::device_vector<double> d_idf_dense(V, 0.0);
+
     {
-        int blockSizeTF = 256;
-        int gridSizeTF  = N; // one block per doc
+        int block = 256;
 
-        auto t_tf_start = Clock::now();
-        tf_count_kernel<<<gridSizeTF, blockSizeTF>>>(d_terms,
-                                                     d_doc_offsets,
-                                                     d_doc_len,
-                                                     d_counts,
-                                                     N,
-                                                     V);
-        err = cudaDeviceSynchronize();
-        auto t_tf_end = Clock::now();
+        int grid_scatter = (n_df + block - 1) / block;
+        scatter_df_kernel<<<grid_scatter, block>>>(
+            thrust::raw_pointer_cast(d_terms_df.data()),
+            thrust::raw_pointer_cast(d_df_vals.data()),
+            thrust::raw_pointer_cast(d_df_dense.data()),
+            n_df
+        );
+        cudaDeviceSynchronize();
 
-        if (err != cudaSuccess) {
-            cerr << "cudaDeviceSynchronize failed after tf_count_kernel: "
-                 << cudaGetErrorString(err) << endl;
-            goto GPU_CLEANUP;
-        }
-        cout << "TF counting (GPU) Time: "
-             << chrono::duration<double>(t_tf_end - t_tf_start).count() << " seconds" << endl;
+        int grid_idf = (V + block - 1) / block;
+        compute_idf_kernel<<<grid_idf, block>>>(
+            thrust::raw_pointer_cast(d_df_dense.data()),
+            thrust::raw_pointer_cast(d_idf_dense.data()),
+            N, V
+        );
+        cudaDeviceSynchronize();
     }
 
-    // ---- Kernel 2: DF from counts (GPU) + host 上算 IDF ----
+    // Sparse TF-IDF
+    thrust::device_vector<double> d_tfidf_vals(nnz);
+
+    auto t_tfidf_start = Clock::now();
     {
-        int blockSizeDF = 256;
-        int gridSizeDF  = (V + blockSizeDF - 1) / blockSizeDF;
-
-        auto t_df_start = Clock::now();
-        df_from_counts_kernel<<<gridSizeDF, blockSizeDF>>>(d_counts,
-                                                           d_df,
-                                                           N,
-                                                           V);
-        err = cudaDeviceSynchronize();
-        if (err != cudaSuccess) {
-            cerr << "cudaDeviceSynchronize failed after df_from_counts_kernel: "
-                 << cudaGetErrorString(err) << endl;
-            goto GPU_CLEANUP;
-        }
-
-        // 取回 df[t]
-        err = cudaMemcpy(df_host.data(), d_df, df_bytes, cudaMemcpyDeviceToHost);
-        if (err != cudaSuccess) {
-            cerr << "cudaMemcpy d_df -> df_host failed: "
-                 << cudaGetErrorString(err) << endl;
-            goto GPU_CLEANUP;
-        }
-
-        // 在 CPU 上算 idf[t] = log(N / df[t])，保持與 serial.cpp 相同的 log 實作
-        for (int t = 0; t < V; ++t) {
-            int df_t = df_host[t];
-            if (df_t > 0) {
-                idf_vec[t] = std::log(static_cast<double>(N) / static_cast<double>(df_t));
-            } else {
-                idf_vec[t] = 0.0;
-            }
-        }
-
-        // idf_vec -> d_idf
-        err = cudaMemcpy(d_idf, idf_vec.data(), idf_bytes, cudaMemcpyHostToDevice);
-        if (err != cudaSuccess) {
-            cerr << "cudaMemcpy idf_vec -> d_idf failed: "
-                 << cudaGetErrorString(err) << endl;
-            goto GPU_CLEANUP;
-        }
-
-        auto t_df_end = Clock::now();
-        cout << "IDF: DF on GPU + log on CPU Time: "
-             << chrono::duration<double>(t_df_end - t_df_start).count() << " seconds" << endl;
+        int block = 256;
+        int grid = (nnz + block - 1) / block;
+        tfidf_sparse_kernel<<<grid, block>>>(
+            thrust::raw_pointer_cast(d_doc_ids_nnz.data()),
+            thrust::raw_pointer_cast(d_term_ids_nnz.data()),
+            thrust::raw_pointer_cast(d_counts_nnz.data()),
+            thrust::raw_pointer_cast(d_doc_len.data()),
+            thrust::raw_pointer_cast(d_idf_dense.data()),
+            thrust::raw_pointer_cast(d_tfidf_vals.data()),
+            nnz
+        );
+        cudaDeviceSynchronize();
     }
+    auto t_tfidf_end = Clock::now();
 
-    // ---- Kernel 3: TF-IDF (GPU) ----
-    {
-        int blockSizeTFIDF = 256;
-        long long totalElems_ll = static_cast<long long>(N) * static_cast<long long>(V);
-        int totalElems = static_cast<int>(totalElems_ll);
-        int gridSizeTFIDF = (totalElems + blockSizeTFIDF - 1) / blockSizeTFIDF;
-
-        auto t_tfidf_start = Clock::now();
-        tfidf_dense_kernel<<<gridSizeTFIDF, blockSizeTFIDF>>>(d_counts,
-                                                              d_idf,
-                                                              d_doc_len,
-                                                              d_tfidf,
-                                                              N,
-                                                              V);
-        err = cudaDeviceSynchronize();
-        if (err != cudaSuccess) {
-            cerr << "cudaDeviceSynchronize failed after tfidf_dense_kernel: "
-                 << cudaGetErrorString(err) << endl;
-            goto GPU_CLEANUP;
-        }
-
-        // 把 counts / tfidf 拿回 host
-        err = cudaMemcpy(counts_host.data(), d_counts, counts_bytes, cudaMemcpyDeviceToHost);
-        if (err != cudaSuccess) {
-            cerr << "cudaMemcpy d_counts -> counts_host failed: "
-                 << cudaGetErrorString(err) << endl;
-            goto GPU_CLEANUP;
-        }
-        err = cudaMemcpy(tfidf_host.data(), d_tfidf, tfidf_bytes, cudaMemcpyDeviceToHost);
-        if (err != cudaSuccess) {
-            cerr << "cudaMemcpy d_tfidf -> tfidf_host failed: "
-                 << cudaGetErrorString(err) << endl;
-            goto GPU_CLEANUP;
-        }
-
-        auto t_tfidf_end = Clock::now();
-        cout << "TF-IDF (GPU) Time: "
-             << chrono::duration<double>(t_tfidf_end - t_tfidf_start).count() << " seconds" << endl;
-    }
-
-GPU_CLEANUP:
-    cudaFree(d_counts);
-    cudaFree(d_tfidf);
-    cudaFree(d_terms);
-    cudaFree(d_doc_offsets);
-    cudaFree(d_doc_len);
-    cudaFree(d_df);
-    cudaFree(d_idf);
+    cout << "TF-IDF (sparse GPU) Time: "
+         << chrono::duration<double>(t_tfidf_end - t_tfidf_start).count()
+         << " seconds" << endl;
 
     auto t9 = Clock::now();
-    cout << "Total TF/IDF/TF-IDF GPU pipeline Time: "
-         << chrono::duration<double>(t9 - t8).count() << " seconds" << endl;
+    cout << "Total sparse GPU pipeline Time: "
+         << chrono::duration<double>(t9 - t8).count()
+         << " seconds" << endl;
 
-    // 如果前面有錯（err != cudaSuccess），counts_host / tfidf_host 內容可能無效，
-    // 這裡簡單判斷一下，錯了就直接結束，不寫 CSV。
-    if (err != cudaSuccess) {
-        cerr << "Error occurred in GPU pipeline, abort writing cuda.csv" << endl;
-        double total_time_err = chrono::duration<double>(t9 - t0).count();
-        cout << "------------------------------------------" << endl;
-        cout << "Total Execution Time (including load, with error): "
-             << total_time_err << " seconds" << endl;
-        cout << "------------------------------------------" << endl;
-        return 1;
-    }
+    // Phase 6: Copy nnz results and save CSV
+    vector<int> doc_ids_nnz(nnz);
+    vector<int> term_ids_nnz(nnz);
+    vector<int> counts_nnz(nnz);
+    vector<double> tfidf_vals(nnz);
 
-    // ---------------------------
-    // Phase 6: Save to CSV
-    // 只要該詞在該 doc 出現過（count > 0），就輸出一列。
-    // 即使 idf = 0 導致 tfidf = 0 也會輸出，與 serial.cpp 行為一致。
-    // 順序：doc 0..N-1，vocab 依字典序。
-// ---------------------------
+    thrust::copy(d_doc_ids_nnz.begin(), d_doc_ids_nnz.end(), doc_ids_nnz.begin());
+    thrust::copy(d_term_ids_nnz.begin(), d_term_ids_nnz.end(), term_ids_nnz.begin());
+    thrust::copy(d_counts_nnz.begin(), d_counts_nnz.end(), counts_nnz.begin());
+    thrust::copy(d_tfidf_vals.begin(), d_tfidf_vals.end(), tfidf_vals.begin());
+
     ofstream fout("cuda.csv");
     fout << "document_id,word,tfidf_value\n";
-
-    for (int d = 0; d < N; ++d) {
-        size_t base = static_cast<size_t>(d) * V;
-        for (int j = 0; j < V; ++j) {
-            int cnt = counts_host[base + j];
-            if (cnt > 0) {
-                double val = tfidf_host[base + j];
-                fout << d << "," << vocab[j] << "," << val << "\n";
-            }
-        }
+    for (int i = 0; i < nnz; ++i) {
+        int d = doc_ids_nnz[i];
+        int t = term_ids_nnz[i];
+        double val = tfidf_vals[i];
+        fout << d << "," << vocab[t] << "," << val << "\n";
     }
     fout.close();
     cout << "TF-IDF saved to cuda.csv" << endl;
 
-    // ---------------------------
     // Summary
-    // ---------------------------
     double total_time = chrono::duration<double>(t9 - t0).count();
     cout << "------------------------------------------" << endl;
     cout << "Total Execution Time (including load): "
