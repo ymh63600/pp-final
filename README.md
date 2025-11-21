@@ -109,7 +109,7 @@ run --mpi=pmix -N 2 -n 4 -- ./mpi
 run -- ./cuda
 ```
 
-### 6. python scikit-learn 版本
+### 7. python scikit-learn 版本
 
 語法：
 
