@@ -85,19 +85,41 @@ make
 ./openmp
 ```
 
+### 5. MPI 版本
+
+語法：
+
+```bash
+run --mpi=pmix -N <nodes> -n <processes> -- ./mpi
+```
+
+例如：
+
+```bash
+run --mpi=pmix -N 2 -n 4 -- ./mpi
+```
+
+### 6. CUDA 版本
+
+語法：
+
+```bash
+run ./cuda
+```
+
 ---
 
-### 5. Compare CSV 版本
+### 7. Compare CSV 版本
 
 用來比對兩個 CSV 檔案（TF-IDF 結果）。
 
-#### 5.1 直接執行
+#### 7.1 直接執行
 
 ```bash
 ./compare file1.csv file2.csv
 ```
 
-#### 5.2 使用 Makefile 動態傳參
+#### 7.2 使用 Makefile 動態傳參
 
 ```bash
 make run_compare CSV1=file1.csv CSV2=file2.csv
