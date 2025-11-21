@@ -17,6 +17,8 @@ make
 * `simd`     — SIMD 向量化版本 (需要支援 AVX2 的 CPU)
 * `pthread`  — Pthread 平行化版本
 * `openmp`   — OpenMP 平行化版本
+* `mpi`   — MPI 平行化版本
+* `cuda`   — CUDA 平行化版本
 * `compare`  — CSV 檔案比對工具
 
 ---
