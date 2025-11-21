@@ -110,7 +110,7 @@ run_mpi: $(TARGET_MPI)
 #----------------- sklearn ------------
 run_sklearn: 
 	@echo "--- Running sklearn ---"
-	run -- python3 sklearn.py
+	run -- python3 sklearn_tfidf.py
 
 # ---------------- Compare CSV ----------------
 $(TARGET_COMPARE): $(SRC_COMPARE)

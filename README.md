@@ -114,7 +114,7 @@ run -- ./cuda
 語法：
 
 ```bash
-run -- python3 sklearn.py
+run -- python3 sklearn_tfidf.py
 ```
 
 ---
