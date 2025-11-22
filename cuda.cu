@@ -8,6 +8,7 @@
 #include <iostream>
 #include <vector>
 #include <string>
+#include <string_view>
 #include <fstream>
 #include <filesystem>
 #include <chrono>
@@ -24,9 +25,10 @@ namespace fs = std::filesystem;
 using Clock = chrono::high_resolution_clock;
 
 // ------------------------------------------------------------
-// Fast whitespace tokenizer (same semantics as stringstream >> w)
+// Fast whitespace tokenizer using string_view (no string copy)
+// same semantics as stringstream >> w
 // ------------------------------------------------------------
-static inline void tokenize_ws(const string& text, vector<string>& out_tokens) {
+static inline void tokenize_ws_sv(const string& text, vector<string_view>& out_tokens) {
     out_tokens.clear();
     const char* s = text.c_str();
     size_t n = text.size();
@@ -37,7 +39,7 @@ static inline void tokenize_ws(const string& text, vector<string>& out_tokens) {
         if (i >= n) break;
         size_t j = i;
         while (j < n && !isspace((unsigned char)s[j])) ++j;
-        out_tokens.emplace_back(text.substr(i, j - i));
+        out_tokens.emplace_back(s + i, j - i);
         i = j;
     }
 }
@@ -173,45 +175,52 @@ int main() {
         return 1;
     }
 
-    // Phase 2: Tokenization on CPU (fast scan)
+    // Phase 2: Tokenization on CPU (string_view fast scan)
     auto t2 = Clock::now();
-    vector<vector<string>> tokenized_docs;
+    vector<vector<string_view>> tokenized_docs;
     tokenized_docs.reserve(N);
 
-    vector<string> tmp_tokens;
+    vector<string_view> tmp_tokens_sv;
     for (const auto& doc : documents) {
-        tokenize_ws(doc, tmp_tokens);
-        tokenized_docs.push_back(tmp_tokens);
+        tokenize_ws_sv(doc, tmp_tokens_sv);
+        tokenized_docs.push_back(tmp_tokens_sv);
     }
     auto t3 = Clock::now();
-    cout << "Tokenization Time (CPU fast scan): "
+    cout << "Tokenization Time (CPU string_view scan): "
          << chrono::duration<double>(t3 - t2).count() << " seconds" << endl;
 
-    // Phase 3: Build vocab (unordered_map, no duplicate keys) and flatten tokens
+    // Phase 3: Build vocab and flatten tokens (reserve + std::unordered_map)
     auto t4 = Clock::now();
 
+    size_t total_tokens_est = 0;
+    for (int d = 0; d < N; ++d) total_tokens_est += tokenized_docs[d].size();
+    size_t est_vocab = total_tokens_est / 6 + 1024;
+
     unordered_map<string, int> word2id;
-    word2id.reserve(400000);
+    word2id.reserve(est_vocab);
     word2id.max_load_factor(0.7f);
 
     vector<string> vocab_unsorted;
-    vocab_unsorted.reserve(400000);
+    vocab_unsorted.reserve(est_vocab);
 
     vector<int> doc_len(N, 0);
     vector<int> terms_flat;
-    terms_flat.reserve(10000000);
+    terms_flat.reserve(total_tokens_est);
     vector<int> doc_ids_flat;
-    doc_ids_flat.reserve(10000000);
+    doc_ids_flat.reserve(total_tokens_est);
 
     size_t total_tokens = 0;
+
     for (int d = 0; d < N; ++d) {
-        for (const auto& w : tokenized_docs[d]) {
-            auto it = word2id.find(w);
+        for (const auto& w_sv : tokenized_docs[d]) {
+            string w_str(w_sv);
+
+            auto it = word2id.find(w_str);
             int term_id;
             if (it == word2id.end()) {
                 term_id = (int)vocab_unsorted.size();
-                vocab_unsorted.push_back(w);
-                word2id.emplace(w, term_id);
+                vocab_unsorted.push_back(w_str);
+                word2id.emplace(vocab_unsorted.back(), term_id);
             } else {
                 term_id = it->second;
             }
@@ -224,7 +233,7 @@ int main() {
     }
 
     auto t5 = Clock::now();
-    cout << "Build vocab (unordered_map) + term indices Time (CPU): "
+    cout << "Build vocab (reserve + unordered_map + string_view tokenize) + term indices Time (CPU): "
          << chrono::duration<double>(t5 - t4).count() << " seconds" << endl;
     cout << "Total mapped tokens: " << total_tokens << endl;
 

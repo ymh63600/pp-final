@@ -2,47 +2,80 @@
 #include <iostream>
 #include <vector>
 #include <string>
+#include <string_view>
 #include <sstream>
-#include <map>
+#include <unordered_map>
+#include <unordered_set>
 #include <cmath>
-#include <set>
 #include <fstream>
 #include <filesystem>
 #include <chrono>
 #include <algorithm>
+#include <cctype>
+#include <numeric>   // for std::iota
 
 using namespace std;
 namespace fs = std::filesystem;
 
 using Clock = chrono::high_resolution_clock;
+using sv = std::string_view;
 
 // -----------------------------------------
-// Tokenize: split by whitespace
+// string_view hash/eq for unordered containers
 // -----------------------------------------
-vector<string> tokenize(const string& text) {
-    vector<string> tokens;
-    stringstream ss(text);
-    string w;
-    while (ss >> w) {
-        tokens.push_back(w);
+struct SvHashSimple {
+    size_t operator()(sv x) const noexcept {
+        return std::hash<sv>{}(x);
     }
+};
+struct SvEqSimple {
+    bool operator()(sv a, sv b) const noexcept { return a == b; }
+};
+
+using TFMap  = std::unordered_map<sv, double, SvHashSimple, SvEqSimple>;
+using DFMap  = std::unordered_map<sv, int,    SvHashSimple, SvEqSimple>;
+using IDFMap = std::unordered_map<sv, double, SvHashSimple, SvEqSimple>;
+
+// -----------------------------------------
+// Fast whitespace tokenizer (string_view)
+// Same semantics as stringstream >> w
+// -----------------------------------------
+static inline void tokenize_ws_sv(const string& text, vector<sv>& out_tokens) {
+    out_tokens.clear();
+    const char* s = text.c_str();
+    size_t n = text.size();
+    size_t i = 0;
+
+    while (i < n) {
+        while (i < n && isspace((unsigned char)s[i])) ++i;
+        if (i >= n) break;
+        size_t j = i;
+        while (j < n && !isspace((unsigned char)s[j])) ++j;
+        out_tokens.emplace_back(s + i, j - i);
+        i = j;
+    }
+}
+
+static inline vector<sv> tokenize_fast_sv(const string& text) {
+    vector<sv> tokens;
+    tokenize_ws_sv(text, tokens);
     return tokens;
 }
 
 // -----------------------------------------
-// Compute TF for one document
+// Compute TF for one document (unordered_map)
 // -----------------------------------------
-map<string, double> computeTF(const vector<string>& words) {
-    map<string, double> tf;
-    if (words.empty()) {
-        return tf;
-    }
+static inline TFMap computeTF(const vector<sv>& words) {
+    TFMap tf;
+    if (words.empty()) return tf;
+
+    tf.reserve(words.size() / 2 + 8);
 
     for (const auto& w : words) {
         tf[w] += 1.0;
     }
 
-    double total = static_cast<double>(words.size());
+    double total = (double)words.size();
     for (auto& kv : tf) {
         kv.second /= total;
     }
@@ -52,11 +85,12 @@ map<string, double> computeTF(const vector<string>& words) {
 // -----------------------------------------
 // Compute TF-IDF for one document
 // -----------------------------------------
-map<string, double> computeTFIDF(const map<string, double>& tf,
-                                 const map<string, double>& idf) {
-    map<string, double> out;
+static inline TFMap computeTFIDF(const TFMap& tf, const IDFMap& idf) {
+    TFMap out;
+    out.reserve(tf.size());
+
     for (const auto& kv : tf) {
-        const string& w = kv.first;
+        sv w = kv.first;
         double tfv = kv.second;
         auto it = idf.find(w);
         double idfv = (it != idf.end()) ? it->second : 0.0;
@@ -89,7 +123,7 @@ void distribute_paths(const vector<string>& all_paths,
                       vector<int>& local_doc_ids,
                       vector<string>& local_paths) {
     if (world_rank == 0) {
-        int N = static_cast<int>(all_paths.size());
+        int N = (int)all_paths.size();
 
         vector<vector<int>> ids_per_rank(world_size);
         vector<vector<string>> paths_per_rank(world_size);
@@ -101,7 +135,7 @@ void distribute_paths(const vector<string>& all_paths,
         }
 
         for (int r = 1; r < world_size; ++r) {
-            int k = static_cast<int>(ids_per_rank[r].size());
+            int k = (int)ids_per_rank[r].size();
             MPI_Send(&k, 1, MPI_INT, r, 10, MPI_COMM_WORLD);
 
             if (k > 0) {
@@ -112,7 +146,7 @@ void distribute_paths(const vector<string>& all_paths,
                     oss << p << "\n";
                 }
                 string packed = oss.str();
-                int packed_len = static_cast<int>(packed.size());
+                int packed_len = (int)packed.size();
 
                 MPI_Send(&packed_len, 1, MPI_INT, r, 12, MPI_COMM_WORLD);
                 if (packed_len > 0) {
@@ -150,13 +184,11 @@ void distribute_paths(const vector<string>& all_paths,
                 istringstream iss(packed);
                 string line;
                 while (getline(iss, line)) {
-                    if (!line.empty()) {
-                        local_paths.push_back(line);
-                    }
+                    if (!line.empty()) local_paths.push_back(line);
                 }
             }
 
-            if (static_cast<int>(local_paths.size()) != k) {
+            if ((int)local_paths.size() != k) {
                 local_paths.resize(k);
             }
         }
@@ -169,7 +201,6 @@ void distribute_paths(const vector<string>& all_paths,
 void load_documents_from_paths(const vector<string>& paths, vector<string>& documents) {
     documents.clear();
     documents.reserve(paths.size());
-
     for (const auto& p : paths) {
         ifstream fin(p);
         if (!fin.is_open()) {
@@ -180,48 +211,58 @@ void load_documents_from_paths(const vector<string>& paths, vector<string>& docu
         string line;
         string content;
         while (getline(fin, line)) {
-            content += line + " ";
+            content += line;
+            content.push_back(' ');
         }
         documents.push_back(std::move(content));
     }
 }
 
 // -----------------------------------------
-// MPI-based IDF computation (unchanged)
+// MPI-based IDF computation (optimized local DF)
+// tokenized is size N, only local indices filled.
+// vocab_storage: output vocab strings on every rank (backing store)
+// out_idf uses string_view keys to vocab_storage.
 // -----------------------------------------
-void computeIDF_MPI(const vector<vector<string>>& tokenized,
+void computeIDF_MPI(const vector<vector<sv>>& tokenized,
                     int world_rank,
                     int world_size,
-                    map<string, double>& out_idf) {
-    int N = static_cast<int>(tokenized.size());
+                    vector<string>& vocab_storage,
+                    IDFMap& out_idf) {
+    int N = (int)tokenized.size();
 
-    map<string, double> local_df;
+    DFMap local_df;
+    local_df.reserve(200000);
 
+    // local DF
     for (int i = 0; i < N; ++i) {
-        if (i % world_size != world_rank) {
-            continue;
-        }
-
+        if (i % world_size != world_rank) continue;
         const auto& words = tokenized[i];
-        if (words.empty()) {
-            continue;
-        }
+        if (words.empty()) continue;
 
-        set<string> seen(words.begin(), words.end());
-        for (const auto& w : seen) {
-            local_df[w] += 1.0;
-        }
+        unordered_set<sv, SvHashSimple, SvEqSimple> seen;
+        seen.reserve(words.size());
+
+        for (auto w : words) seen.insert(w);
+        for (auto w : seen) local_df[w] += 1;
     }
 
+    // pack local df to string
     ostringstream oss_local;
     for (const auto& kv : local_df) {
         oss_local << kv.first << " " << kv.second << "\n";
     }
     string local_str = oss_local.str();
-    int local_len = static_cast<int>(local_str.size());
+    int local_len = (int)local_str.size();
 
     if (world_rank == 0) {
-        map<string, double> global_df = local_df;
+        // global df on root (owning strings)
+        unordered_map<string, double> global_df;
+        global_df.reserve(local_df.size() * world_size + 1024);
+
+        for (const auto& kv : local_df) {
+            global_df[string(kv.first)] += (double)kv.second;
+        }
 
         for (int src = 1; src < world_size; ++src) {
             int recv_len = 0;
@@ -241,50 +282,64 @@ void computeIDF_MPI(const vector<vector<string>>& tokenized,
             }
         }
 
-        vector<string> vocab;
+        // build vocab + idf arrays
+        vocab_storage.clear();
+        vocab_storage.reserve(global_df.size());
+
         vector<double> idf_vals;
-        vocab.reserve(global_df.size());
         idf_vals.reserve(global_df.size());
 
         for (const auto& kv : global_df) {
             const string& w = kv.first;
             double df = kv.second;
             if (df > 0.0) {
-                vocab.push_back(w);
-                idf_vals.push_back(log(static_cast<double>(N) / df));
+                vocab_storage.push_back(w);
+                idf_vals.push_back(log((double)N / df));
             }
         }
 
-        int V = static_cast<int>(vocab.size());
+        // sort vocab to make broadcast deterministic
+        vector<int> perm(vocab_storage.size());
+        iota(perm.begin(), perm.end(), 0);
+        sort(perm.begin(), perm.end(),
+             [&](int a, int b){ return vocab_storage[a] < vocab_storage[b]; });
 
+        vector<string> vocab_sorted;
+        vector<double> idf_sorted;
+        vocab_sorted.reserve(vocab_storage.size());
+        idf_sorted.reserve(vocab_storage.size());
+
+        for (int idx : perm) {
+            vocab_sorted.push_back(vocab_storage[idx]);
+            idf_sorted.push_back(idf_vals[idx]);
+        }
+        vocab_storage.swap(vocab_sorted);
+        idf_vals.swap(idf_sorted);
+
+        int V = (int)vocab_storage.size();
         MPI_Bcast(&V, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
         ostringstream oss_vocab;
-        for (const auto& w : vocab) {
-            oss_vocab << w << "\n";
-        }
+        for (const auto& w : vocab_storage) oss_vocab << w << "\n";
         string vocab_str = oss_vocab.str();
-        int vocab_len = static_cast<int>(vocab_str.size());
+        int vocab_len = (int)vocab_str.size();
 
         MPI_Bcast(&vocab_len, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        if (vocab_len > 0) {
-            MPI_Bcast(vocab_str.data(), vocab_len, MPI_CHAR, 0, MPI_COMM_WORLD);
-        }
+        if (vocab_len > 0) MPI_Bcast(vocab_str.data(), vocab_len, MPI_CHAR, 0, MPI_COMM_WORLD);
 
-        if (V > 0) {
-            MPI_Bcast(idf_vals.data(), V, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-        }
+        if (V > 0) MPI_Bcast(idf_vals.data(), V, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
+        // build idf map with string_view referencing vocab_storage
         out_idf.clear();
+        out_idf.reserve(V * 2 + 8);
         for (int i = 0; i < V; ++i) {
-            out_idf[vocab[i]] = idf_vals[i];
+            out_idf[sv(vocab_storage[i])] = idf_vals[i];
         }
 
     } else {
+        // send local df to root
         MPI_Send(&local_len, 1, MPI_INT, 0, 0, MPI_COMM_WORLD);
-        if (local_len > 0) {
-            MPI_Send(local_str.data(), local_len, MPI_CHAR, 0, 1, MPI_COMM_WORLD);
-        }
+        if (local_len > 0) MPI_Send(local_str.data(), local_len, MPI_CHAR, 0, 1, MPI_COMM_WORLD);
 
         int V = 0;
         MPI_Bcast(&V, 1, MPI_INT, 0, MPI_COMM_WORLD);
@@ -292,8 +347,8 @@ void computeIDF_MPI(const vector<vector<string>>& tokenized,
         int vocab_len = 0;
         MPI_Bcast(&vocab_len, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-        vector<string> vocab;
-        vocab.reserve(V);
+        vocab_storage.clear();
+        vocab_storage.reserve(V);
 
         if (vocab_len > 0) {
             string vocab_str;
@@ -303,25 +358,20 @@ void computeIDF_MPI(const vector<vector<string>>& tokenized,
             istringstream iss_vocab(vocab_str);
             string w;
             while (getline(iss_vocab, w)) {
-                if (!w.empty()) {
-                    vocab.push_back(w);
-                }
+                if (!w.empty()) vocab_storage.push_back(w);
             }
         }
 
-        vector<double> idf_vals;
-        idf_vals.resize(V);
-
-        if (V > 0) {
-            MPI_Bcast(idf_vals.data(), V, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-        }
+        vector<double> idf_vals(V);
+        if (V > 0) MPI_Bcast(idf_vals.data(), V, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
         out_idf.clear();
-        int realV = static_cast<int>(vocab.size());
-        int useV = (realV < V) ? realV : V;
+        out_idf.reserve(V * 2 + 8);
 
+        int realV = (int)vocab_storage.size();
+        int useV = (realV < V) ? realV : V;
         for (int i = 0; i < useV; ++i) {
-            out_idf[vocab[i]] = idf_vals[i];
+            out_idf[sv(vocab_storage[i])] = idf_vals[i];
         }
     }
 }
@@ -346,7 +396,7 @@ int main(int argc, char** argv) {
 
     if (world_rank == 0) {
         list_txt_files_sorted(dataset_path, all_paths);
-        N = static_cast<int>(all_paths.size());
+        N = (int)all_paths.size();
     }
 
     MPI_Bcast(&N, 1, MPI_INT, 0, MPI_COMM_WORLD);
@@ -383,31 +433,28 @@ int main(int argc, char** argv) {
     auto t1 = Clock::now();
 
     // Phase 2: tokenization (parallel over documents across ranks)
-    vector<vector<string>> tokenized(N);
+    vector<vector<sv>> tokenized(N);
 
     for (int i = 0; i < N; ++i) {
-        if (i % world_size != world_rank) {
-            continue;
-        }
-        tokenized[i] = tokenize(documents[i]);
+        if (i % world_size != world_rank) continue;
+        tokenized[i] = tokenize_fast_sv(documents[i]);
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
     auto t2 = Clock::now();
 
     // Phase 3: compute IDF using MPI
-    map<string, double> idf;
-    computeIDF_MPI(tokenized, world_rank, world_size, idf);
+    vector<string> vocab_storage;
+    IDFMap idf;
+    computeIDF_MPI(tokenized, world_rank, world_size, vocab_storage, idf);
 
     MPI_Barrier(MPI_COMM_WORLD);
     auto t3 = Clock::now();
 
     // Phase 4: compute TF for documents assigned to this rank
-    vector<map<string, double>> tf(N);
+    vector<TFMap> tf(N);
     for (int i = 0; i < N; ++i) {
-        if (i % world_size != world_rank) {
-            continue;
-        }
+        if (i % world_size != world_rank) continue;
         tf[i] = computeTF(tokenized[i]);
     }
 
@@ -415,11 +462,9 @@ int main(int argc, char** argv) {
     auto t4 = Clock::now();
 
     // Phase 5: compute TF-IDF for documents assigned to this rank
-    vector<map<string, double>> tfidf(N);
+    vector<TFMap> tfidf(N);
     for (int i = 0; i < N; ++i) {
-        if (i % world_size != world_rank) {
-            continue;
-        }
+        if (i % world_size != world_rank) continue;
         tfidf[i] = computeTFIDF(tf[i], idf);
     }
 
@@ -429,18 +474,22 @@ int main(int argc, char** argv) {
     // Phase 6: send TF-IDF results to rank 0 and write mpi.csv
     ostringstream oss_local;
     for (int i = 0; i < N; ++i) {
-        if (i % world_size != world_rank) {
-            continue;
-        }
-        for (const auto& kv : tfidf[i]) {
-            const string& w = kv.first;
-            double val = kv.second;
-            oss_local << i << "," << w << "," << val << "\n";
+        if (i % world_size != world_rank) continue;
+
+        // sort by word to match old map order
+        vector<pair<sv,double>> items;
+        items.reserve(tfidf[i].size());
+        for (const auto& kv : tfidf[i]) items.push_back(kv);
+        sort(items.begin(), items.end(),
+             [](const auto& a, const auto& b){ return a.first < b.first; });
+
+        for (const auto& kv : items) {
+            oss_local << i << "," << kv.first << "," << kv.second << "\n";
         }
     }
 
     string local_str = oss_local.str();
-    int local_len = static_cast<int>(local_str.size());
+    int local_len = (int)local_str.size();
 
     if (world_rank == 0) {
         ofstream fout("mpi.csv");
@@ -464,9 +513,7 @@ int main(int argc, char** argv) {
         cout << "TF-IDF saved to mpi.csv" << endl;
     } else {
         MPI_Send(&local_len, 1, MPI_INT, 0, 2, MPI_COMM_WORLD);
-        if (local_len > 0) {
-            MPI_Send(local_str.data(), local_len, MPI_CHAR, 0, 3, MPI_COMM_WORLD);
-        }
+        if (local_len > 0) MPI_Send(local_str.data(), local_len, MPI_CHAR, 0, 3, MPI_COMM_WORLD);
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
