@@ -9,6 +9,7 @@
 #include <fstream>
 #include <filesystem>
 #include <chrono>
+#include <algorithm>
 
 using namespace std;
 namespace fs = std::filesystem;
@@ -65,32 +66,128 @@ map<string, double> computeTFIDF(const map<string, double>& tf,
 }
 
 // -----------------------------------------
-// Load 20-newsgroups-like dataset
+// Phase 1 helper: list all .txt files, sorted
+// Only rank 0 calls this.
 // -----------------------------------------
-void load_20newsgroups(const string& root, vector<string>& documents) {
+void list_txt_files_sorted(const string& root, vector<string>& out_paths) {
+    out_paths.clear();
     for (const auto& entry : fs::recursive_directory_iterator(root)) {
         if (entry.is_regular_file() && entry.path().extension() == ".txt") {
-            ifstream fin(entry.path());
-            if (!fin.is_open()) {
-                continue;
+            out_paths.push_back(entry.path().string());
+        }
+    }
+    sort(out_paths.begin(), out_paths.end());
+}
+
+// -----------------------------------------
+// Phase 1 helper: distribute doc_ids and paths
+// Assignment rule: doc_id % world_size
+// -----------------------------------------
+void distribute_paths(const vector<string>& all_paths,
+                      int world_rank,
+                      int world_size,
+                      vector<int>& local_doc_ids,
+                      vector<string>& local_paths) {
+    if (world_rank == 0) {
+        int N = static_cast<int>(all_paths.size());
+
+        vector<vector<int>> ids_per_rank(world_size);
+        vector<vector<string>> paths_per_rank(world_size);
+
+        for (int i = 0; i < N; ++i) {
+            int r = i % world_size;
+            ids_per_rank[r].push_back(i);
+            paths_per_rank[r].push_back(all_paths[i]);
+        }
+
+        for (int r = 1; r < world_size; ++r) {
+            int k = static_cast<int>(ids_per_rank[r].size());
+            MPI_Send(&k, 1, MPI_INT, r, 10, MPI_COMM_WORLD);
+
+            if (k > 0) {
+                MPI_Send(ids_per_rank[r].data(), k, MPI_INT, r, 11, MPI_COMM_WORLD);
+
+                ostringstream oss;
+                for (const auto& p : paths_per_rank[r]) {
+                    oss << p << "\n";
+                }
+                string packed = oss.str();
+                int packed_len = static_cast<int>(packed.size());
+
+                MPI_Send(&packed_len, 1, MPI_INT, r, 12, MPI_COMM_WORLD);
+                if (packed_len > 0) {
+                    MPI_Send(packed.data(), packed_len, MPI_CHAR, r, 13, MPI_COMM_WORLD);
+                }
+            } else {
+                int packed_len = 0;
+                MPI_Send(&packed_len, 1, MPI_INT, r, 12, MPI_COMM_WORLD);
             }
-            string line;
-            string content;
-            while (getline(fin, line)) {
-                content += line + " ";
+        }
+
+        local_doc_ids = std::move(ids_per_rank[0]);
+        local_paths   = std::move(paths_per_rank[0]);
+
+    } else {
+        int k = 0;
+        MPI_Recv(&k, 1, MPI_INT, 0, 10, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        local_doc_ids.clear();
+        local_paths.clear();
+        local_doc_ids.resize(k);
+        local_paths.reserve(k);
+
+        if (k > 0) {
+            MPI_Recv(local_doc_ids.data(), k, MPI_INT, 0, 11, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+            int packed_len = 0;
+            MPI_Recv(&packed_len, 1, MPI_INT, 0, 12, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+            if (packed_len > 0) {
+                string packed;
+                packed.resize(packed_len);
+                MPI_Recv(packed.data(), packed_len, MPI_CHAR, 0, 13, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+                istringstream iss(packed);
+                string line;
+                while (getline(iss, line)) {
+                    if (!line.empty()) {
+                        local_paths.push_back(line);
+                    }
+                }
             }
-            documents.push_back(content);
+
+            if (static_cast<int>(local_paths.size()) != k) {
+                local_paths.resize(k);
+            }
         }
     }
 }
 
 // -----------------------------------------
-// MPI-based IDF computation
-// Each rank:
-//   1) only looks at docs i where i % world_size == world_rank
-//   2) builds local df map<string,double>
-//   3) non-root ranks send local df to rank 0
-//   4) rank 0 merges, computes global IDF, then broadcasts IDF to all ranks
+// Phase 1 helper: load local docs from paths
+// -----------------------------------------
+void load_documents_from_paths(const vector<string>& paths, vector<string>& documents) {
+    documents.clear();
+    documents.reserve(paths.size());
+
+    for (const auto& p : paths) {
+        ifstream fin(p);
+        if (!fin.is_open()) {
+            documents.push_back("");
+            continue;
+        }
+
+        string line;
+        string content;
+        while (getline(fin, line)) {
+            content += line + " ";
+        }
+        documents.push_back(std::move(content));
+    }
+}
+
+// -----------------------------------------
+// MPI-based IDF computation (unchanged)
 // -----------------------------------------
 void computeIDF_MPI(const vector<vector<string>>& tokenized,
                     int world_rank,
@@ -98,7 +195,6 @@ void computeIDF_MPI(const vector<vector<string>>& tokenized,
                     map<string, double>& out_idf) {
     int N = static_cast<int>(tokenized.size());
 
-    // Step 1: local DF for docs assigned to this rank
     map<string, double> local_df;
 
     for (int i = 0; i < N; ++i) {
@@ -117,7 +213,6 @@ void computeIDF_MPI(const vector<vector<string>>& tokenized,
         }
     }
 
-    // Step 2: non-root ranks serialize local_df and send to rank 0
     ostringstream oss_local;
     for (const auto& kv : local_df) {
         oss_local << kv.first << " " << kv.second << "\n";
@@ -126,7 +221,6 @@ void computeIDF_MPI(const vector<vector<string>>& tokenized,
     int local_len = static_cast<int>(local_str.size());
 
     if (world_rank == 0) {
-        // Rank 0: merge global DF
         map<string, double> global_df = local_df;
 
         for (int src = 1; src < world_size; ++src) {
@@ -147,7 +241,6 @@ void computeIDF_MPI(const vector<vector<string>>& tokenized,
             }
         }
 
-        // Step 3: build ordered vocab and binary idf array
         vector<string> vocab;
         vector<double> idf_vals;
         vocab.reserve(global_df.size());
@@ -164,10 +257,8 @@ void computeIDF_MPI(const vector<vector<string>>& tokenized,
 
         int V = static_cast<int>(vocab.size());
 
-        // Broadcast vocab size
         MPI_Bcast(&V, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-        // Broadcast vocab strings as one packed char buffer
         ostringstream oss_vocab;
         for (const auto& w : vocab) {
             oss_vocab << w << "\n";
@@ -180,29 +271,24 @@ void computeIDF_MPI(const vector<vector<string>>& tokenized,
             MPI_Bcast(vocab_str.data(), vocab_len, MPI_CHAR, 0, MPI_COMM_WORLD);
         }
 
-        // Broadcast idf values in binary
         if (V > 0) {
             MPI_Bcast(idf_vals.data(), V, MPI_DOUBLE, 0, MPI_COMM_WORLD);
         }
 
-        // Fill out_idf on rank 0
         out_idf.clear();
         for (int i = 0; i < V; ++i) {
             out_idf[vocab[i]] = idf_vals[i];
         }
 
     } else {
-        // Non-root: send local_df to rank 0
         MPI_Send(&local_len, 1, MPI_INT, 0, 0, MPI_COMM_WORLD);
         if (local_len > 0) {
             MPI_Send(local_str.data(), local_len, MPI_CHAR, 0, 1, MPI_COMM_WORLD);
         }
 
-        // Receive vocab size
         int V = 0;
         MPI_Bcast(&V, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-        // Receive vocab packed string
         int vocab_len = 0;
         MPI_Bcast(&vocab_len, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
@@ -223,7 +309,6 @@ void computeIDF_MPI(const vector<vector<string>>& tokenized,
             }
         }
 
-        // Receive idf values in binary
         vector<double> idf_vals;
         idf_vals.resize(V);
 
@@ -231,7 +316,6 @@ void computeIDF_MPI(const vector<vector<string>>& tokenized,
             MPI_Bcast(idf_vals.data(), V, MPI_DOUBLE, 0, MPI_COMM_WORLD);
         }
 
-        // Rebuild out_idf
         out_idf.clear();
         int realV = static_cast<int>(vocab.size());
         int useV = (realV < V) ? realV : V;
@@ -255,11 +339,17 @@ int main(int argc, char** argv) {
 
     auto t0 = Clock::now();
 
-    // Phase 1: all ranks load the same dataset
-    vector<string> documents;
+    // Phase 1: rank 0 builds file list, each rank loads only its docs
     string dataset_path = "dataset";
-    load_20newsgroups(dataset_path, documents);
-    int N = static_cast<int>(documents.size());
+    vector<string> all_paths;
+    int N = 0;
+
+    if (world_rank == 0) {
+        list_txt_files_sorted(dataset_path, all_paths);
+        N = static_cast<int>(all_paths.size());
+    }
+
+    MPI_Bcast(&N, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
     if (world_rank == 0) {
         cout << "--- MPI TF-IDF ---" << endl;
@@ -273,6 +363,20 @@ int main(int argc, char** argv) {
         }
         MPI_Finalize();
         return 0;
+    }
+
+    vector<int> local_doc_ids;
+    vector<string> local_paths;
+    distribute_paths(all_paths, world_rank, world_size, local_doc_ids, local_paths);
+
+    vector<string> local_docs;
+    load_documents_from_paths(local_paths, local_docs);
+
+    vector<string> documents;
+    documents.resize(N);
+    for (int j = 0; j < (int)local_docs.size(); ++j) {
+        int doc_id = local_doc_ids[j];
+        documents[doc_id] = std::move(local_docs[j]);
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
@@ -291,7 +395,7 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto t2 = Clock::now();
 
-    // Phase 3: compute IDF using MPI (parallel df + reduction + broadcast)
+    // Phase 3: compute IDF using MPI
     map<string, double> idf;
     computeIDF_MPI(tokenized, world_rank, world_size, idf);
 
@@ -323,7 +427,6 @@ int main(int argc, char** argv) {
     auto t5 = Clock::now();
 
     // Phase 6: send TF-IDF results to rank 0 and write mpi.csv
-    // Each rank serializes its own assigned documents into lines.
     ostringstream oss_local;
     for (int i = 0; i < N; ++i) {
         if (i % world_size != world_rank) {
@@ -340,14 +443,11 @@ int main(int argc, char** argv) {
     int local_len = static_cast<int>(local_str.size());
 
     if (world_rank == 0) {
-        // Rank 0: prepare to receive from others and write file
         ofstream fout("mpi.csv");
         fout << "document_id,word,tfidf_value\n";
 
-        // First write its own data
         fout << local_str;
 
-        // Receive from other ranks
         for (int src = 1; src < world_size; ++src) {
             int recv_len = 0;
             MPI_Recv(&recv_len, 1, MPI_INT, src, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -363,7 +463,6 @@ int main(int argc, char** argv) {
         fout.close();
         cout << "TF-IDF saved to mpi.csv" << endl;
     } else {
-        // Non-root: send local TF-IDF CSV fragment to rank 0
         MPI_Send(&local_len, 1, MPI_INT, 0, 2, MPI_COMM_WORLD);
         if (local_len > 0) {
             MPI_Send(local_str.data(), local_len, MPI_CHAR, 0, 3, MPI_COMM_WORLD);
