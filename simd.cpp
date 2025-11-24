@@ -179,6 +179,7 @@ int main(int argc, char** argv) {
     timing_point_t t_total0 = timing_clock_t::now();
     timing_point_t start_time, end_time;
 
+    cout << "--- SIMD TF-IDF Timing Report --- " << endl;
     // Phase 1: Load documents
     start_time = timing_clock_t::now();
     vector<string> documents;
