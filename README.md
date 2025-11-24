@@ -50,19 +50,17 @@ run -- ./simd
 語法：
 
 ```bash
-run -c <thread-num> -- ./pthread <thread-num>
+run -c <thread-num> -- ./pthread <dataset> <thread-num>
 ```
 
 例如指定 6 threads：
 
 ```bash
-run -c 6 -- ./pthread 6
+run -c 6 -- ./pthread dataset 6
 ```
-
-若不帶參數，預設使用 **4 threads**：
-
+Make:
 ```bash
-run -c 4 -- ./pthread
+make run_pthread NUM=4
 ```
 
 ---
@@ -72,19 +70,17 @@ run -c 4 -- ./pthread
 語法：
 
 ```bash
-run -c <thread-num> -- ./openmp <thread-num>
+run -c <thread-num> -- ./openmp <dataset> <thread-num>
 ```
 
 例如：
 
 ```bash
-run -c 8 -- ./openmp 8
+run -c 8 -- ./openmp dataset 8
 ```
-
-若不帶參數，預設使用 **4 threads**：
-
+Make:
 ```bash
-run -c 4 -- ./openmp
+make run_pthread NUM=4
 ```
 
 ### 5. MPI 版本
