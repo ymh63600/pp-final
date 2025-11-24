@@ -112,7 +112,7 @@ static inline void tokenize_ws_to_ids(const string& text,
 }
 
 // ------------------------------------------------------------
-// Pthreads Structure and Functions
+// Pthreads Structures and Functions
 // ------------------------------------------------------------
 
 // 執行緒參數結構體 for Phase 2: Tokenization
@@ -154,7 +154,8 @@ void* df_calc_thread_func(void* arg) {
         const auto& ids = (*data->doc_term_ids)[d];
         tmp.assign(ids.begin(), ids.end());
         sort(tmp.begin(), tmp.end());
-        tmp.erase(unique(tmp.begin(), tmp.end()), tmp.end());
+        // Unique ensures we count DF only once per document
+        tmp.erase(unique(tmp.begin(), tmp.end()), tmp.end()); 
 
         for (int term_id : tmp) {
             if (term_id < data->V) {
@@ -166,69 +167,92 @@ void* df_calc_thread_func(void* arg) {
 }
 
 
-// 執行緒參數結構體 for Phase 4/5a: TF/TF-IDF Calculation
-struct TFIDFThreadData {
+// 執行緒參數結構體 for Phase 4: TF Calculation
+struct TFThreadData {
     int start_doc_index;
     int end_doc_index;
     const vector<vector<int>>* doc_term_ids;
-    const vector<double>* idf;
-    const vector<string>* id2word;
-    vector<vector<pair<int, double>>>* all_tf_results;
-    vector<string>* out_lines_local; // 每個執行緒本地的 TF-IDF 輸出 CSV 行
+    // 輸出：每個文件稀疏的 <Term ID, TF Value> 向量
+    vector<vector<pair<int, double>>>* all_tf_results; 
 };
 
-void* tfidf_calc_thread_func(void* arg) {
-    TFIDFThreadData* data = (TFIDFThreadData*)arg;
-    
-    vector<int> tmp;
-    vector<pair<string, double>> tfidf_pairs;
+void* tf_calc_thread_func(void* arg) {
+    TFThreadData* data = (TFThreadData*)arg;
     
     for (int d = data->start_doc_index; d < data->end_doc_index; d++) {
         const auto& ids = (*data->doc_term_ids)[d];
         if (ids.empty()) continue;
         
-        // --- Phase 4: Compute TF (Sparse) ---
-        tmp.assign(ids.begin(), ids.end());
+        // 1. 複製並排序所有 Term ID
+        vector<int> tmp(ids.begin(), ids.end());
         sort(tmp.begin(), tmp.end());
 
         const double total = (double)tmp.size();
         vector<pair<int, double>> tf_sparse;
         tf_sparse.reserve(tmp.size() / 4 + 4);
 
+        // 2. 計算每個 Term 的頻率
         size_t i = 0;
         while (i < tmp.size()) {
             int term_id = tmp[i];
             size_t j = i + 1;
             while (j < tmp.size() && tmp[j] == term_id) j++;
 
-            double tf = (double)(j - i) / total;
+            // Term Frequency (TF) = (count of term) / (total words in document)
+            double tf = (double)(j - i) / total; 
             tf_sparse.emplace_back(term_id, tf);
             i = j;
         }
 
         (*data->all_tf_results)[d] = std::move(tf_sparse);
+    }
+    pthread_exit(NULL);
+}
 
-        // --- Phase 5a: Compute TF-IDF ---
+// 執行緒參數結構體 for Phase 5: TF-IDF Calculation and Output Generation
+struct TFIDFGenerateThreadData {
+    int start_doc_index;
+    int end_doc_index;
+    // 輸入：稀疏 TF 結果
+    const vector<vector<pair<int, double>>>* all_tf_results;
+    const vector<double>* idf;
+    const vector<string>* id2word;
+    // 輸出：每個執行緒本地的 TF-IDF 輸出 CSV 行
+    vector<string>* out_lines_local; 
+};
+
+void* tfidf_generate_thread_func(void* arg) {
+    TFIDFGenerateThreadData* data = (TFIDFGenerateThreadData*)arg;
+    
+    vector<pair<string, double>> tfidf_pairs;
+    
+    for (int d = data->start_doc_index; d < data->end_doc_index; d++) {
+        const auto& tf_sparse = (*data->all_tf_results)[d];
+        if (tf_sparse.empty()) continue;
+
+        // 1. Compute TF-IDF
         tfidf_pairs.clear();
-        tfidf_pairs.reserve((*data->all_tf_results)[d].size());
+        tfidf_pairs.reserve(tf_sparse.size());
 
-        for (const auto& kv : (*data->all_tf_results)[d]) {
+        for (const auto& kv : tf_sparse) {
             int term_id = kv.first;
             double tf_val = kv.second;
+            // TF-IDF = TF * IDF
             double tfidf_val = tf_val * (*data->idf)[term_id]; 
             tfidf_pairs.emplace_back((*data->id2word)[term_id], tfidf_val); 
         }
 
+        // 2. Sort by word for consistent output
         sort(tfidf_pairs.begin(), tfidf_pairs.end(),
              [](const auto& a, const auto& b) {
                  return a.first < b.first;
              });
 
+        // 3. Generate output lines
         for (const auto& p : tfidf_pairs) {
             data->out_lines_local->push_back(to_string(d) + "," + p.first + "," + to_string(p.second) + "\n");
         }
     }
-
     pthread_exit(NULL);
 }
 
@@ -283,14 +307,13 @@ int main(int argc, char** argv) {
     }
 
     const int N = (int)documents.size();
-
-    // 為了動態執行緒數，我們需要使用動態分配的陣列或 std::vector 來儲存執行緒 ID 和參數
-    vector<pthread_t> threads;
-    threads.resize(NUM_THREADS);
     
     // 計算任務分配參數
+    vector<pthread_t> threads(NUM_THREADS);
     int chunk_size = N / NUM_THREADS;
     int remaining = N % NUM_THREADS;
+    int current_doc = 0;
+
 
     // ------------------------------------------------------------
     // Phase 2: Tokenization + build vocab (Parallelized & Lock-Optimized)
@@ -304,7 +327,7 @@ int main(int argc, char** argv) {
     vector<vector<int>> doc_term_ids(N);
 
     vector<TokenThreadData> token_thread_data(NUM_THREADS);
-    int current_doc = 0;
+    current_doc = 0;
 
     for (int i = 0; i < NUM_THREADS; i++) {
         token_thread_data[i].start_doc_index = current_doc;
@@ -342,7 +365,6 @@ int main(int argc, char** argv) {
     vector<DFThreadData> df_thread_data(NUM_THREADS);
     
     current_doc = 0;
-    // 重用 Phase 2 的任務分配邏輯和 threads 向量
     for (int i = 0; i < NUM_THREADS; i++) {
         df_thread_data[i].start_doc_index = current_doc;
         df_thread_data[i].end_doc_index = current_doc + chunk_size + (i < remaining ? 1 : 0);
@@ -374,27 +396,53 @@ int main(int argc, char** argv) {
     cout << "Compute DF/IDF Time: " << idf_duration << " seconds (DF Parallel, IDF Serial)\n";
 
     // ------------------------------------------------------------
-    // Phase 4/5a: Compute TF and TF-IDF (Parallelized)
+    // Phase 4: Compute TF (Parallelized) - NEW PHASE
     // ------------------------------------------------------------
     start_time = timing_clock_t::now();
 
-    vector<vector<pair<int, double>>> all_tf_results(N);
-    vector<vector<string>> all_out_lines_local(NUM_THREADS);
-
-    vector<TFIDFThreadData> tfidf_thread_data(NUM_THREADS);
+    // 儲存稀疏 TF 結果的向量
+    vector<vector<pair<int, double>>> all_tf_results(N); 
+    vector<TFThreadData> tf_thread_data(NUM_THREADS);
     
     current_doc = 0;
     for (int i = 0; i < NUM_THREADS; i++) {
-        tfidf_thread_data[i].start_doc_index = current_doc;
-        tfidf_thread_data[i].end_doc_index = current_doc + chunk_size + (i < remaining ? 1 : 0);
-        tfidf_thread_data[i].doc_term_ids = &doc_term_ids;
-        tfidf_thread_data[i].idf = &idf;
-        tfidf_thread_data[i].id2word = &id2word;
-        tfidf_thread_data[i].all_tf_results = &all_tf_results;
-        tfidf_thread_data[i].out_lines_local = &all_out_lines_local[i];
+        tf_thread_data[i].start_doc_index = current_doc;
+        tf_thread_data[i].end_doc_index = current_doc + chunk_size + (i < remaining ? 1 : 0);
+        tf_thread_data[i].doc_term_ids = &doc_term_ids;
+        tf_thread_data[i].all_tf_results = &all_tf_results;
 
-        pthread_create(&threads[i], NULL, tfidf_calc_thread_func, &tfidf_thread_data[i]);
-        current_doc = tfidf_thread_data[i].end_doc_index;
+        pthread_create(&threads[i], NULL, tf_calc_thread_func, &tf_thread_data[i]);
+        current_doc = tf_thread_data[i].end_doc_index;
+    }
+
+    for (int i = 0; i < NUM_THREADS; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    end_time = timing_clock_t::now();
+    double tf_compute_duration = chrono::duration<double>(end_time - start_time).count();
+    cout << "Compute TF Time: " << tf_compute_duration << " seconds (Parallel)\n";
+
+
+    // ------------------------------------------------------------
+    // Phase 5: Compute TF-IDF and Output Generation (Parallelized) - NEW PHASE
+    // ------------------------------------------------------------
+    start_time = timing_clock_t::now();
+
+    vector<vector<string>> all_out_lines_local(NUM_THREADS);
+    vector<TFIDFGenerateThreadData> tfidf_generate_thread_data(NUM_THREADS);
+    
+    current_doc = 0;
+    for (int i = 0; i < NUM_THREADS; i++) {
+        tfidf_generate_thread_data[i].start_doc_index = current_doc;
+        tfidf_generate_thread_data[i].end_doc_index = current_doc + chunk_size + (i < remaining ? 1 : 0);
+        tfidf_generate_thread_data[i].all_tf_results = &all_tf_results;
+        tfidf_generate_thread_data[i].idf = &idf;
+        tfidf_generate_thread_data[i].id2word = &id2word;
+        tfidf_generate_thread_data[i].out_lines_local = &all_out_lines_local[i];
+
+        pthread_create(&threads[i], NULL, tfidf_generate_thread_func, &tfidf_generate_thread_data[i]);
+        current_doc = tfidf_generate_thread_data[i].end_doc_index;
     }
 
     for (int i = 0; i < NUM_THREADS; i++) {
@@ -415,15 +463,15 @@ int main(int argc, char** argv) {
     }
 
     end_time = timing_clock_t::now();
-    double tfidf_compute_duration = chrono::duration<double>(end_time - start_time).count();
-    cout << "Compute All TF-IDFs Time: " << tfidf_compute_duration << " seconds (Parallel)\n";
+    double tfidf_generate_duration = chrono::duration<double>(end_time - start_time).count();
+    cout << "Compute TF-IDF & Generate Output Time: " << tfidf_generate_duration << " seconds (Parallel)\n";
 
     // Total time includes load, excludes CSV write
     timing_point_t t_total_end_excl_write = timing_clock_t::now();
     double total_excl_write = chrono::duration<double>(t_total_end_excl_write - t_total0).count();
 
     // ------------------------------------------------------------
-    // Phase 5b: Write CSV (Output to pthread.csv)
+    // Phase 6: Write CSV (Output to pthread.csv)
     // ------------------------------------------------------------
     start_time = timing_clock_t::now();
 
