@@ -1,10 +1,12 @@
-// cuda.cu
+// cuda.cu 
 #include <cuda_runtime.h>
 #include <thrust/device_vector.h>
 #include <thrust/sort.h>
 #include <thrust/reduce.h>
 #include <thrust/transform.h>
 #include <thrust/iterator/zip_iterator.h>
+#include <thrust/iterator/constant_iterator.h>
+#include <cub/cub.cuh>
 #include <iostream>
 #include <vector>
 #include <string>
@@ -126,33 +128,6 @@ void tfidf_sparse_kernel(const int* doc_ids,
     double tf = (double)c / (double)len;
     tfidf_vals[i] = tf * idf_dense[t];
 }
-
-// Thrust functors
-struct MakeKeyFunctor {
-    int V;
-    __host__ __device__
-    uint64_t operator()(const thrust::tuple<int,int>& x) const {
-        uint64_t d = (uint64_t)thrust::get<0>(x);
-        uint64_t t = (uint64_t)thrust::get<1>(x);
-        return d * (uint64_t)V + t;
-    }
-};
-
-struct KeyToDocFunctor {
-    int V;
-    __host__ __device__
-    int operator()(const uint64_t& k) const {
-        return (int)(k / (uint64_t)V);
-    }
-};
-
-struct KeyToTermFunctor {
-    int V;
-    __host__ __device__
-    int operator()(const uint64_t& k) const {
-        return (int)(k % (uint64_t)V);
-    }
-};
 
 int main() {
     ios::sync_with_stdio(false);
@@ -278,51 +253,92 @@ int main() {
     double t_idf_cpu = chrono::duration<double>(t5 - t4).count();
     t_token = t_token + t_idf_cpu;
 
-    // Stage 4: Compute All TFs Time on GPU (H2D + keys + sort + reduce)
+    // Build doc segment offsets for segmented TF counting
+    vector<int> h_offsets(N + 1);
+    h_offsets[0] = 0;
+    for (int d = 0; d < N; ++d) {
+        h_offsets[d + 1] = h_offsets[d] + doc_len[d];
+    }
+
+    // Stage 4: Compute All TFs Time on GPU
+    // segmented per-doc radix sort + per-doc reduce_by_key
     auto t_tf_start = Clock::now();
 
+    int total_tokens_i = (int)total_tokens;
+
     thrust::device_vector<int> d_terms(terms_flat.begin(), terms_flat.end());
-    thrust::device_vector<int> d_doc_ids(doc_ids_flat.begin(), doc_ids_flat.end());
     thrust::device_vector<int> d_doc_len(doc_len.begin(), doc_len.end());
+    thrust::device_vector<int> d_offsets(h_offsets.begin(), h_offsets.end());
 
-    thrust::device_vector<uint64_t> d_keys(total_tokens);
-    MakeKeyFunctor make_key{V};
-    thrust::transform(
-        thrust::make_zip_iterator(thrust::make_tuple(d_doc_ids.begin(), d_terms.begin())),
-        thrust::make_zip_iterator(thrust::make_tuple(d_doc_ids.end(), d_terms.end())),
-        d_keys.begin(),
-        make_key
+    // Segmented radix sort: sort term ids within each doc segment
+    thrust::device_vector<int> d_terms_sorted(total_tokens_i);
+
+    size_t temp_bytes_tf = 0;
+    cub::DeviceSegmentedRadixSort::SortKeys(
+        nullptr, temp_bytes_tf,
+        thrust::raw_pointer_cast(d_terms.data()),
+        thrust::raw_pointer_cast(d_terms_sorted.data()),
+        total_tokens_i,
+        N,
+        thrust::raw_pointer_cast(d_offsets.data()),
+        thrust::raw_pointer_cast(d_offsets.data()) + 1
     );
 
-    thrust::sort(d_keys.begin(), d_keys.end());
+    thrust::device_vector<uint8_t> d_temp_tf(temp_bytes_tf);
 
-    thrust::device_vector<uint64_t> d_ukeys(total_tokens);
-    thrust::device_vector<int> d_ones(total_tokens, 1);
-    thrust::device_vector<int> d_counts_nnz(total_tokens);
-
-    auto new_end = thrust::reduce_by_key(
-        d_keys.begin(), d_keys.end(),
-        d_ones.begin(),
-        d_ukeys.begin(),
-        d_counts_nnz.begin()
+    cub::DeviceSegmentedRadixSort::SortKeys(
+        thrust::raw_pointer_cast(d_temp_tf.data()), temp_bytes_tf,
+        thrust::raw_pointer_cast(d_terms.data()),
+        thrust::raw_pointer_cast(d_terms_sorted.data()),
+        total_tokens_i,
+        N,
+        thrust::raw_pointer_cast(d_offsets.data()),
+        thrust::raw_pointer_cast(d_offsets.data()) + 1
     );
 
-    int nnz = (int)(new_end.first - d_ukeys.begin());
-    d_ukeys.resize(nnz);
+    // Per-doc reduce_by_key for TF counting
+    thrust::device_vector<int> d_doc_ids_nnz(total_tokens_i);
+    thrust::device_vector<int> d_term_ids_nnz(total_tokens_i);
+    thrust::device_vector<int> d_counts_nnz(total_tokens_i);
+
+    int nnz_total = 0;
+    auto ones_it = thrust::make_constant_iterator<int>(1);
+
+    for (int d = 0; d < N; ++d) {
+        int seg_begin = h_offsets[d];
+        int seg_end   = h_offsets[d + 1];
+        if (seg_begin == seg_end) continue;
+
+        auto out_terms = d_term_ids_nnz.begin() + nnz_total;
+        auto out_cnts  = d_counts_nnz.begin() + nnz_total;
+
+        auto new_end = thrust::reduce_by_key(
+            d_terms_sorted.begin() + seg_begin,
+            d_terms_sorted.begin() + seg_end,
+            ones_it,
+            out_terms,
+            out_cnts
+        );
+
+        int seg_nnz = (int)(new_end.first - out_terms);
+
+        thrust::fill(
+            d_doc_ids_nnz.begin() + nnz_total,
+            d_doc_ids_nnz.begin() + nnz_total + seg_nnz,
+            d
+        );
+
+        nnz_total += seg_nnz;
+    }
+
+    int nnz = nnz_total;
+    d_doc_ids_nnz.resize(nnz);
+    d_term_ids_nnz.resize(nnz);
     d_counts_nnz.resize(nnz);
 
     cudaDeviceSynchronize();
     auto t_tf_end = Clock::now();
     double t_tf = chrono::duration<double>(t_tf_end - t_tf_start).count();
-
-    // Extract doc_ids_nnz and term_ids_nnz
-    thrust::device_vector<int> d_doc_ids_nnz(nnz);
-    thrust::device_vector<int> d_term_ids_nnz(nnz);
-
-    KeyToDocFunctor key_to_doc{V};
-    KeyToTermFunctor key_to_term{V};
-    thrust::transform(d_ukeys.begin(), d_ukeys.end(), d_doc_ids_nnz.begin(), key_to_doc);
-    thrust::transform(d_ukeys.begin(), d_ukeys.end(), d_term_ids_nnz.begin(), key_to_term);
 
     // Stage 3 part B: GPU DF reduce + scatter + compute IDF
     auto t_dfidf_start = Clock::now();
