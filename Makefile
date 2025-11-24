@@ -79,7 +79,7 @@ $(TARGET_PTHREAD): $(SRC_PTHREAD)
 
 run_pthread: $(TARGET_PTHREAD)
 	@echo "--- Running $(TARGET_PTHREAD) with $(NUM) threads on $(DATASET) ---"
-	./$(TARGET_PTHREAD) $(DATASET) $(NUM)
+	run -c $(NUM) -- ./$(TARGET_PTHREAD) $(DATASET) $(NUM)
 
 # ---------------- OpenMP ----------------
 $(TARGET_OPENMP): $(SRC_OPENMP)
@@ -87,11 +87,7 @@ $(TARGET_OPENMP): $(SRC_OPENMP)
 
 run_openmp: $(TARGET_OPENMP)
 	@echo "--- Running $(TARGET_OPENMP) with $(NUM) threads on $(DATASET) ---"
-	./$(TARGET_OPENMP) $(DATASET) $(NUM)
-
-# ---------------- Prevent numbers as targets ----------------
-%:
-	@:
+	run -c $(NUM) -- ./$(TARGET_OPENMP) $(DATASET) $(NUM)
 
 # ---------------- CUDA ----------------
 $(TARGET_CUDA): $(SRC_CUDA)
