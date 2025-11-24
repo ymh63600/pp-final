@@ -37,6 +37,9 @@ SRC_CUDA       = cuda.cu
 TARGET_MPI     = mpi
 SRC_MPI        = mpi.cpp
 
+NUM ?= 4
+DATASET ?= dataset
+
 # ----------------------------------------------------
 # 指令
 # ----------------------------------------------------
@@ -75,18 +78,18 @@ $(TARGET_PTHREAD): $(SRC_PTHREAD)
 	$(CXX) $(CXXFLAGS) $< -o $@ -pthread
 
 run_pthread: $(TARGET_PTHREAD)
-	@echo "--- Running $(TARGET_PTHREAD) with $(NUM) threads ---"
-	run -c $(NUM) -- ./$(TARGET_PTHREAD) $(NUM)
+	@echo "--- Running $(TARGET_PTHREAD) with $(NUM) threads on $(DATASET) ---"
+	./$(TARGET_PTHREAD) $(DATASET) $(NUM)
 
 # ---------------- OpenMP ----------------
 $(TARGET_OPENMP): $(SRC_OPENMP)
 	$(CXX) $(CXXFLAGS) $< -o $@ -fopenmp
 
 run_openmp: $(TARGET_OPENMP)
-	@echo "--- Running $(TARGET_OPENMP) with $(NUM) threads ---"
-	run -c $(NUM) -- ./$(TARGET_OPENMP) $(NUM)
+	@echo "--- Running $(TARGET_OPENMP) with $(NUM) threads on $(DATASET) ---"
+	./$(TARGET_OPENMP) $(DATASET) $(NUM)
 
-# Prevent make from treating numbers as targets
+# ---------------- Prevent numbers as targets ----------------
 %:
 	@:
 
@@ -128,4 +131,4 @@ run_compare:
 # ---------------- Clean ----------------
 clean:
 	@echo "Cleaning up generated files..."
-	rm -f $(TARGET_SERIAL) $(TARGET_PTHREAD) $(TARGET_OPENMP) $(TARGET_SIMD) $(TARGET_COMPARE) $(TARGET_CUDA) $(TARGET_MPI) *.o
+	rm -f $(TARGET_SERIAL) $(TARGET_PTHREAD) $(TARGET_OPENMP) $(TARGET_SIMD) $(TARGET_COMPARE) $(TARGET_CUDA) $(TARGET_MPI) *.o *.csv
