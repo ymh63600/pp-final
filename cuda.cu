@@ -24,10 +24,8 @@ namespace fs = std::filesystem;
 
 using Clock = chrono::high_resolution_clock;
 
-// ------------------------------------------------------------
 // Fast whitespace tokenizer using string_view (no string copy)
-// same semantics as stringstream >> w
-// ------------------------------------------------------------
+// Same semantics as stringstream >> w
 static inline void tokenize_ws_sv(const string& text, vector<string_view>& out_tokens) {
     out_tokens.clear();
     const char* s = text.c_str();
@@ -37,36 +35,48 @@ static inline void tokenize_ws_sv(const string& text, vector<string_view>& out_t
     while (i < n) {
         while (i < n && isspace((unsigned char)s[i])) ++i;
         if (i >= n) break;
+
         size_t j = i;
         while (j < n && !isspace((unsigned char)s[j])) ++j;
+
         out_tokens.emplace_back(s + i, j - i);
         i = j;
     }
 }
 
-// ------------------------------------------------------------
-// Load 20-Newsgroups files
-// ------------------------------------------------------------
+// Load 20-Newsgroups files in sorted order aligned with serial/MPI
 void load_20newsgroups(const string& root, vector<string>& documents) {
+    documents.clear();
+
+    vector<fs::path> files;
+    if (!fs::exists(root)) return;
+
     for (const auto& entry : fs::recursive_directory_iterator(root)) {
         if (entry.is_regular_file() && entry.path().extension() == ".txt") {
-            ifstream fin(entry.path());
-            if (!fin.is_open()) continue;
-
-            string line;
-            string content;
-            while (getline(fin, line)) {
-                content += line;
-                content.push_back(' ');
-            }
-            documents.push_back(std::move(content));
+            files.push_back(entry.path());
         }
+    }
+
+    sort(files.begin(), files.end());
+
+    documents.reserve(files.size());
+
+    for (const auto& path : files) {
+        ifstream fin(path, ios::in | ios::binary);
+        if (!fin.is_open()) continue;
+
+        string content;
+        fin.seekg(0, ios::end);
+        size_t sz = (size_t)fin.tellg();
+        fin.seekg(0, ios::beg);
+        content.resize(sz);
+        fin.read(&content[0], sz);
+
+        documents.push_back(std::move(content));
     }
 }
 
-// ------------------------------------------------------------
 // CUDA kernels for sparse pipeline
-// ------------------------------------------------------------
 __global__
 void scatter_df_kernel(const int* terms_df,
                        const int* df_vals,
@@ -121,9 +131,7 @@ void tfidf_sparse_kernel(const int* doc_ids,
     tfidf_vals[i] = tf * idf_dense[t];
 }
 
-// ------------------------------------------------------------
 // Thrust functors
-// ------------------------------------------------------------
 struct MakeKeyFunctor {
     int V;
     __host__ __device__
@@ -150,9 +158,6 @@ struct KeyToTermFunctor {
     }
 };
 
-// ------------------------------------------------------------
-// Main
-// ------------------------------------------------------------
 int main() {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
@@ -189,7 +194,7 @@ int main() {
     cout << "Tokenization Time (CPU string_view scan): "
          << chrono::duration<double>(t3 - t2).count() << " seconds" << endl;
 
-    // Phase 3: Build vocab and flatten tokens (reserve + std::unordered_map)
+    // Phase 3: Build vocab and flatten tokens
     auto t4 = Clock::now();
 
     size_t total_tokens_est = 0;
@@ -233,7 +238,7 @@ int main() {
     }
 
     auto t5 = Clock::now();
-    cout << "Build vocab (reserve + unordered_map + string_view tokenize) + term indices Time (CPU): "
+    cout << "Build vocab + term indices Time (CPU): "
          << chrono::duration<double>(t5 - t4).count() << " seconds" << endl;
     cout << "Total mapped tokens: " << total_tokens << endl;
 
@@ -311,7 +316,7 @@ int main() {
     cudaDeviceSynchronize();
     auto t_tf_end = Clock::now();
 
-    cout << "TF counting (sparse sort reduce on GPU) Time: "
+    cout << "TF counting Time: "
          << chrono::duration<double>(t_tf_end - t_tf_start).count()
          << " seconds (nnz=" << nnz << ")" << endl;
 
@@ -324,7 +329,7 @@ int main() {
     thrust::transform(d_ukeys.begin(), d_ukeys.end(), d_doc_ids_nnz.begin(), key_to_doc);
     thrust::transform(d_ukeys.begin(), d_ukeys.end(), d_term_ids_nnz.begin(), key_to_term);
 
-    // DF by reducing term ids (each unique (doc,term) contributes 1)
+    // DF by reducing term ids
     auto t_df_start = Clock::now();
 
     thrust::device_vector<int> d_term_for_df = d_term_ids_nnz;
@@ -348,7 +353,7 @@ int main() {
     cudaDeviceSynchronize();
     auto t_df_end = Clock::now();
 
-    cout << "DF reduce on GPU Time: "
+    cout << "DF reduce Time: "
          << chrono::duration<double>(t_df_end - t_df_start).count()
          << " seconds (unique_terms=" << n_df << ")" << endl;
 
@@ -397,7 +402,7 @@ int main() {
     }
     auto t_tfidf_end = Clock::now();
 
-    cout << "TF-IDF (sparse GPU) Time: "
+    cout << "TF-IDF Time (GPU): "
          << chrono::duration<double>(t_tfidf_end - t_tfidf_start).count()
          << " seconds" << endl;
 
@@ -409,12 +414,10 @@ int main() {
     // Phase 6: Copy nnz results and save CSV
     vector<int> doc_ids_nnz(nnz);
     vector<int> term_ids_nnz(nnz);
-    vector<int> counts_nnz(nnz);
     vector<double> tfidf_vals(nnz);
 
     thrust::copy(d_doc_ids_nnz.begin(), d_doc_ids_nnz.end(), doc_ids_nnz.begin());
     thrust::copy(d_term_ids_nnz.begin(), d_term_ids_nnz.end(), term_ids_nnz.begin());
-    thrust::copy(d_counts_nnz.begin(), d_counts_nnz.end(), counts_nnz.begin());
     thrust::copy(d_tfidf_vals.begin(), d_tfidf_vals.end(), tfidf_vals.begin());
 
     ofstream fout("cuda.csv");
@@ -423,17 +426,14 @@ int main() {
         int d = doc_ids_nnz[i];
         int t = term_ids_nnz[i];
         double val = tfidf_vals[i];
-        fout << d << "," << vocab[t] << "," << val << "\n";
+        fout << d << "," << vocab[t] << "," << to_string(val) << "\n";
     }
     fout.close();
     cout << "TF-IDF saved to cuda.csv" << endl;
 
-    // Summary
     double total_time = chrono::duration<double>(t9 - t0).count();
-    cout << "------------------------------------------" << endl;
     cout << "Total Execution Time (including load): "
          << total_time << " seconds" << endl;
-    cout << "------------------------------------------" << endl;
 
     return 0;
 }
