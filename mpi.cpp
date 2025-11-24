@@ -385,14 +385,13 @@ int main(int argc, char** argv) {
         tfidf_time_local += chrono::duration<double>(tfidf1 - tfidf0).count();
     }
 
-    auto t_pack_end = Clock::now();
     string out_local = oss_local.str();
     int out_len = (int)out_local.size();
 
-    double tf_time_global = 0.0;
-    double tfidf_time_global = 0.0;
-    MPI_Reduce(&tf_time_local, &tf_time_global, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&tfidf_time_local, &tfidf_time_global, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    double tf_time_max = 0.0;
+    double tfidf_time_max = 0.0;
+    MPI_Reduce(&tf_time_local, &tf_time_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&tfidf_time_local, &tfidf_time_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (world_rank == 0) {
         recv_lens.assign(world_size, 0);
@@ -434,32 +433,34 @@ int main(int argc, char** argv) {
 
         auto t_write1 = Clock::now();
         write_time = chrono::duration<double>(t_write1 - t_write0).count();
-
-        cout << "TF-IDF saved to mpi.csv\n";
-        cout << "CSV Write Time: " << write_time << " s\n";
     }
 
     if (world_rank == 0) {
-        double t_load  = chrono::duration<double>(t1 - t_total0).count();
-        double t_token = chrono::duration<double>(t2 - t1).count();
-        double t_vocab = chrono::duration<double>(t3 - t2).count();
-        double t_idf_t = chrono::duration<double>(t4 - t3).count();
-        double t_tfidf = chrono::duration<double>(t_pack_end - t4).count();
+        double t_doc_load = chrono::duration<double>(t1 - t_total0).count();
+        double t_token    = chrono::duration<double>(t3 - t1).count();
+        double t_idf      = chrono::duration<double>(t4 - t3).count();
 
-        double t_tf_avg = tf_time_global / world_size;
-        double t_tfidf_avg = tfidf_time_global / world_size;
+        double total_excl_write = chrono::duration<double>(t_total_end_excl_write - t_total0).count();
+        double remaining_after_idf = chrono::duration<double>(t_total_end_excl_write - t4).count();
 
-        double t_total = chrono::duration<double>(t_total_end_excl_write - t_total0).count();
+        double t_tf = tf_time_max;
+        double t_tfidf = remaining_after_idf - t_tf;
+        if (t_tfidf < 0.0) t_tfidf = 0.0;
 
-        cout << "Timing (rank 0 approximate):\n";
-        cout << "  Load documents: " << t_load << " s\n";
-        cout << "  Tokenization local: " << t_token << " s\n";
-        cout << "  Build global vocab: " << t_vocab << " s\n";
-        cout << "  Compute IDF MPI: " << t_idf_t << " s\n";
-        cout << "  Compute TF average: " << t_tf_avg << " s\n";
-        cout << "  Compute TF-IDF average: " << t_tfidf_avg << " s\n";
-        cout << "  Compute TF-IDF total local pack: " << t_tfidf << " s\n";
-        cout << "  Total incl load excl write: " << t_total << " s\n";
+        cout << "--- MPI TF-IDF Timing Report ---\n";
+        cout << "Total Documents Loaded: " << N << "\n";
+        cout << "Document Loading Time: " << t_doc_load << " seconds\n";
+        cout << "Tokenization Time: " << t_token << " seconds\n";
+        cout << "Vocabulary Size: " << V << "\n";
+        cout << "Compute IDF Time: " << t_idf << " seconds\n";
+        cout << "Compute All TFs Time: " << t_tf << " seconds\n";
+        cout << "Compute All TF-IDFs Time: " << t_tfidf << " seconds\n";
+        cout << "CSV Write Time: " << write_time << " seconds\n";
+        cout << "TF-IDF saved to mpi.csv\n";
+        cout << "------------------------------------------\n";
+        cout << "Total Execution Time (including load, excluding write): "
+             << total_excl_write << " seconds\n";
+        cout << "------------------------------------------\n";
     }
 
     MPI_Finalize();

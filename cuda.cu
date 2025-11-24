@@ -25,7 +25,6 @@ namespace fs = std::filesystem;
 using Clock = chrono::high_resolution_clock;
 
 // Fast whitespace tokenizer using string_view (no string copy)
-// Same semantics as stringstream >> w
 static inline void tokenize_ws_sv(const string& text, vector<string_view>& out_tokens) {
     out_tokens.clear();
     const char* s = text.c_str();
@@ -98,11 +97,8 @@ void compute_idf_kernel(const int* df_dense,
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= vocab_size) return;
     int df_t = df_dense[t];
-    if (df_t > 0) {
-        idf_dense[t] = log((double)num_docs / (double)df_t);
-    } else {
-        idf_dense[t] = 0.0;
-    }
+    if (df_t > 0) idf_dense[t] = log((double)num_docs / (double)df_t);
+    else idf_dense[t] = 0.0;
 }
 
 __global__
@@ -162,25 +158,32 @@ int main() {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
 
-    // Phase 1: Load documents
+    auto t_total0 = Clock::now();
+
+    // Stage 1: Document Loading Time
     auto t0 = Clock::now();
     vector<string> documents;
     string dataset_path = "dataset";
     load_20newsgroups(dataset_path, documents);
     auto t1 = Clock::now();
+    double t_load = chrono::duration<double>(t1 - t0).count();
 
     int N = (int)documents.size();
-    cout << "--- CUDA TF-IDF Timing Report (Sparse TF DF IDF TF-IDF) ---" << endl;
-    cout << "Total Documents Loaded: " << N << endl;
-    cout << "Document Loading Time: "
-         << chrono::duration<double>(t1 - t0).count() << " seconds" << endl;
-
     if (documents.empty()) {
-        cout << "Error: No documents found. Please check path \"" << dataset_path << "\"" << endl;
+        cout << "--- CUDA TF-IDF Timing Report ---\n";
+        cout << "Total Documents Loaded: 0\n";
+        cout << "Document Loading Time: " << t_load << " seconds\n";
+        cout << "Tokenization Time: 0 seconds\n";
+        cout << "Vocabulary Size: 0\n";
+        cout << "Compute IDF Time: 0 seconds\n";
+        cout << "Compute All TFs Time: 0 seconds\n";
+        cout << "Compute All TF-IDFs Time: 0 seconds\n";
+        cout << "CSV Write Time: 0 seconds\n";
+        cout << "Error: No documents found. Please check path \"" << dataset_path << "\"\n";
         return 1;
     }
 
-    // Phase 2: Tokenization on CPU (string_view fast scan)
+    // Stage 2: Tokenization Time
     auto t2 = Clock::now();
     vector<vector<string_view>> tokenized_docs;
     tokenized_docs.reserve(N);
@@ -191,10 +194,9 @@ int main() {
         tokenized_docs.push_back(tmp_tokens_sv);
     }
     auto t3 = Clock::now();
-    cout << "Tokenization Time (CPU string_view scan): "
-         << chrono::duration<double>(t3 - t2).count() << " seconds" << endl;
+    double t_token = chrono::duration<double>(t3 - t2).count();
 
-    // Phase 3: Build vocab and flatten tokens
+    // Stage 3 part A: CPU build vocab + flatten + sort vocab remap
     auto t4 = Clock::now();
 
     size_t total_tokens_est = 0;
@@ -237,18 +239,19 @@ int main() {
         }
     }
 
-    auto t5 = Clock::now();
-    cout << "Build vocab + term indices Time (CPU): "
-         << chrono::duration<double>(t5 - t4).count() << " seconds" << endl;
-    cout << "Total mapped tokens: " << total_tokens << endl;
-
     if (total_tokens == 0) {
-        cout << "No tokens after mapping to vocabulary. Exit." << endl;
+        cout << "--- CUDA TF-IDF Timing Report ---\n";
+        cout << "Total Documents Loaded: " << N << "\n";
+        cout << "Document Loading Time: " << t_load << " seconds\n";
+        cout << "Tokenization Time: " << t_token << " seconds\n";
+        cout << "Vocabulary Size: 0\n";
+        cout << "Compute IDF Time: 0 seconds\n";
+        cout << "Compute All TFs Time: 0 seconds\n";
+        cout << "Compute All TF-IDFs Time: 0 seconds\n";
+        cout << "CSV Write Time: 0 seconds\n";
+        cout << "No tokens after mapping to vocabulary. Exit.\n";
         return 0;
     }
-
-    // Phase 4: Sort vocab lexicographically and remap ids
-    auto t6 = Clock::now();
 
     int oldV = (int)vocab_unsorted.size();
     vector<int> perm(oldV);
@@ -271,19 +274,17 @@ int main() {
         terms_flat[i] = old2new[terms_flat[i]];
     }
 
-    auto t7 = Clock::now();
-    cout << "Sort vocab + remap term ids Time (CPU): "
-         << chrono::duration<double>(t7 - t6).count() << " seconds" << endl;
-    cout << "Final Vocabulary Size: " << V << endl;
+    auto t5 = Clock::now();
+    double t_idf_cpu = chrono::duration<double>(t5 - t4).count();
+    t_token = t_token + t_idf_cpu;
 
-    // Phase 5: Sparse GPU pipeline
-    auto t8 = Clock::now();
+    // Stage 4: Compute All TFs Time on GPU (H2D + keys + sort + reduce)
+    auto t_tf_start = Clock::now();
 
     thrust::device_vector<int> d_terms(terms_flat.begin(), terms_flat.end());
     thrust::device_vector<int> d_doc_ids(doc_ids_flat.begin(), doc_ids_flat.end());
     thrust::device_vector<int> d_doc_len(doc_len.begin(), doc_len.end());
 
-    // Build keys = doc * V + term
     thrust::device_vector<uint64_t> d_keys(total_tokens);
     MakeKeyFunctor make_key{V};
     thrust::transform(
@@ -292,9 +293,6 @@ int main() {
         d_keys.begin(),
         make_key
     );
-
-    // Sort keys and reduce to sparse counts
-    auto t_tf_start = Clock::now();
 
     thrust::sort(d_keys.begin(), d_keys.end());
 
@@ -315,10 +313,7 @@ int main() {
 
     cudaDeviceSynchronize();
     auto t_tf_end = Clock::now();
-
-    cout << "TF counting Time: "
-         << chrono::duration<double>(t_tf_end - t_tf_start).count()
-         << " seconds (nnz=" << nnz << ")" << endl;
+    double t_tf = chrono::duration<double>(t_tf_end - t_tf_start).count();
 
     // Extract doc_ids_nnz and term_ids_nnz
     thrust::device_vector<int> d_doc_ids_nnz(nnz);
@@ -329,8 +324,8 @@ int main() {
     thrust::transform(d_ukeys.begin(), d_ukeys.end(), d_doc_ids_nnz.begin(), key_to_doc);
     thrust::transform(d_ukeys.begin(), d_ukeys.end(), d_term_ids_nnz.begin(), key_to_term);
 
-    // DF by reducing term ids
-    auto t_df_start = Clock::now();
+    // Stage 3 part B: GPU DF reduce + scatter + compute IDF
+    auto t_dfidf_start = Clock::now();
 
     thrust::device_vector<int> d_term_for_df = d_term_ids_nnz;
     thrust::sort(d_term_for_df.begin(), d_term_for_df.end());
@@ -350,14 +345,6 @@ int main() {
     d_terms_df.resize(n_df);
     d_df_vals.resize(n_df);
 
-    cudaDeviceSynchronize();
-    auto t_df_end = Clock::now();
-
-    cout << "DF reduce Time: "
-         << chrono::duration<double>(t_df_end - t_df_start).count()
-         << " seconds (unique_terms=" << n_df << ")" << endl;
-
-    // Scatter DF to dense and compute dense IDF
     thrust::device_vector<int> d_df_dense(V, 0);
     thrust::device_vector<double> d_idf_dense(V, 0.0);
 
@@ -382,10 +369,16 @@ int main() {
         cudaDeviceSynchronize();
     }
 
-    // Sparse TF-IDF
-    thrust::device_vector<double> d_tfidf_vals(nnz);
+    cudaDeviceSynchronize();
+    auto t_dfidf_end = Clock::now();
+    double t_idf_gpu = chrono::duration<double>(t_dfidf_end - t_dfidf_start).count();
 
+    double t_idf = t_idf_gpu;
+
+    // Stage 5: Compute All TF-IDFs Time (remainder before write)
     auto t_tfidf_start = Clock::now();
+
+    thrust::device_vector<double> d_tfidf_vals(nnz);
     {
         int block = 256;
         int grid = (nnz + block - 1) / block;
@@ -400,18 +393,7 @@ int main() {
         );
         cudaDeviceSynchronize();
     }
-    auto t_tfidf_end = Clock::now();
 
-    cout << "TF-IDF Time (GPU): "
-         << chrono::duration<double>(t_tfidf_end - t_tfidf_start).count()
-         << " seconds" << endl;
-
-    auto t9 = Clock::now();
-    cout << "Total sparse GPU pipeline Time: "
-         << chrono::duration<double>(t9 - t8).count()
-         << " seconds" << endl;
-
-    // Phase 6: Copy nnz results and save CSV
     vector<int> doc_ids_nnz(nnz);
     vector<int> term_ids_nnz(nnz);
     vector<double> tfidf_vals(nnz);
@@ -419,6 +401,16 @@ int main() {
     thrust::copy(d_doc_ids_nnz.begin(), d_doc_ids_nnz.end(), doc_ids_nnz.begin());
     thrust::copy(d_term_ids_nnz.begin(), d_term_ids_nnz.end(), term_ids_nnz.begin());
     thrust::copy(d_tfidf_vals.begin(), d_tfidf_vals.end(), tfidf_vals.begin());
+
+    cudaDeviceSynchronize();
+    auto t_total_end_excl_write = Clock::now();
+    double total_excl_write = chrono::duration<double>(t_total_end_excl_write - t_total0).count();
+
+    double t_tfidf = total_excl_write - (t_load + t_token + t_idf + t_tf);
+    if (t_tfidf < 0.0) t_tfidf = 0.0;
+
+    // Write CSV (not counted)
+    auto t_write0 = Clock::now();
 
     ofstream fout("cuda.csv");
     fout << "document_id,word,tfidf_value\n";
@@ -429,11 +421,25 @@ int main() {
         fout << d << "," << vocab[t] << "," << to_string(val) << "\n";
     }
     fout.close();
-    cout << "TF-IDF saved to cuda.csv" << endl;
 
-    double total_time = chrono::duration<double>(t9 - t0).count();
-    cout << "Total Execution Time (including load): "
-         << total_time << " seconds" << endl;
+    auto t_write1 = Clock::now();
+    double write_time = chrono::duration<double>(t_write1 - t_write0).count();
+
+    // Report
+    cout << "--- CUDA TF-IDF Timing Report ---\n";
+    cout << "Total Documents Loaded: " << N << "\n";
+    cout << "Document Loading Time: " << t_load << " seconds\n";
+    cout << "Tokenization Time: " << t_token << " seconds\n";
+    cout << "Vocabulary Size: " << V << "\n";
+    cout << "Compute IDF Time: " << t_idf << " seconds\n";
+    cout << "Compute All TFs Time: " << t_tf << " seconds\n";
+    cout << "Compute All TF-IDFs Time: " << t_tfidf << " seconds\n";
+    cout << "CSV Write Time: " << write_time << " seconds\n";
+    cout << "TF-IDF saved to cuda.csv\n";
+    cout << "------------------------------------------\n";
+    cout << "Total Execution Time (including load, excluding write): "
+         << total_excl_write << " seconds\n";
+    cout << "------------------------------------------\n";
 
     return 0;
 }
